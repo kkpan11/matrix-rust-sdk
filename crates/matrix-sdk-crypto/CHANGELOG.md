@@ -1,12 +1,42 @@
 # UNRELEASED
 
-Changed:
+Changes:
+
+- Log the content of received `m.room_key.withheld` to-device events.
+  ([#3591](https://github.com/matrix-org/matrix-rust-sdk/pull/3591))
+
+- Attempt to decrypt bundled events (reactions and the latest thread reply) if
+  they are found in the unsigned part of an event.
+  ([#3468](https://github.com/matrix-org/matrix-rust-sdk/pull/3468))
+
+- Sign the device keys with the user-identity (i.e. cross-signing keys) if
+  we're uploading the device keys and if the cross-signing keys are available.
+  This approach eliminates the need to upload signatures in a separate request,
+  ensuring that other users/devices will never encounter this device without a
+  signature from their user identity. Consequently, they will never see the
+  device as unverified.
+  ([#3453](https://github.com/matrix-org/matrix-rust-sdk/pull/3453))
+
+- Avoid emitting entries from `identities_stream_raw` and `devices_stream` when
+  we receive a `/keys/query` response which shows that no devices changed.
+  ([#3442](https://github.com/matrix-org/matrix-rust-sdk/pull/3442))
 
 - Fallback keys are rotated in a time-based manner, instead of waiting for the
   server to tell us that a fallback key got used.
   ([#3151](https://github.com/matrix-org/matrix-rust-sdk/pull/3151))
 
 Breaking changes:
+
+- Add a `custom_account` argument to the `OlmMachine::with_store()` method, this
+  allows users to learn their identity keys before they get access to the user
+  and device ID.
+  ([#3451](https://github.com/matrix-org/matrix-rust-sdk/pull/3451))
+
+- Add a `backup_version` argument to `CryptoStore`'s
+  `inbound_group_sessions_for_backup`,
+  `mark_inbound_group_sessions_as_backed_up` and
+  `inbound_group_session_counts` methods.
+  ([#3253](https://github.com/matrix-org/matrix-rust-sdk/pull/3253))
 
 - Rename the `OlmMachine::invalidate_group_session` method to
   `OlmMachine::discard_room_key`
@@ -17,7 +47,43 @@ Breaking changes:
 - Add new `dehydrated` property to `olm::account::PickledAccount`.
   ([#3164](https://github.com/matrix-org/matrix-rust-sdk/pull/3164))
 
+- Remove deprecated `OlmMachine::import_room_keys`.
+  ([#3448](https://github.com/matrix-org/matrix-rust-sdk/pull/3448))
+
+- Add the `SasState::Created` variant to differentiate the state between the
+  party that sent the verification start and the party that received it.
+
+Deprecations:
+
+- Deprecate `BackupMachine::import_backed_up_room_keys`.
+  ([#3448](https://github.com/matrix-org/matrix-rust-sdk/pull/3448))
+
 Additions:
+
+
+- Expose new method `OlmMachine::clear_crypto_cache()`, with FFI bindings
+  ([#3462](https://github.com/matrix-org/matrix-rust-sdk/pull/3462))
+
+- Expose new method `OlmMachine::upload_device_keys()`.
+  ([#3457](https://github.com/matrix-org/matrix-rust-sdk/pull/3457))
+
+- Expose new method `CryptoStore::import_room_keys`.
+  ([#3448](https://github.com/matrix-org/matrix-rust-sdk/pull/3448))
+
+- Expose new method `BackupMachine::backup_version`.
+  ([#3320](https://github.com/matrix-org/matrix-rust-sdk/pull/3320))
+
+- Add data types to parse the QR code data for the QR code login defined in
+  [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108)
+
+- Expose new method `CryptoStore::clear_caches`.
+  ([#3338](https://github.com/matrix-org/matrix-rust-sdk/pull/3338))
+
+- Expose new method `OlmMachine::device_creation_time`.
+  ([#3275](https://github.com/matrix-org/matrix-rust-sdk/pull/3275))
+
+- Log more details about the Olm session after encryption and decryption.
+  ([#3242](https://github.com/matrix-org/matrix-rust-sdk/pull/3242))
 
 - When Olm message decryption fails, report the error code(s) from the failure.
   ([#3212](https://github.com/matrix-org/matrix-rust-sdk/pull/3212))
@@ -43,6 +109,13 @@ Additions:
 
 - Include event timestamps on logs from event decryption.
   ([#3194](https://github.com/matrix-org/matrix-rust-sdk/pull/3194))
+
+
+## 0.7.1
+
+Security fixes:
+
+- Don't log the private part of the backup key, introduced in [#71136e4](https://github.com/matrix-org/matrix-rust-sdk/commit/71136e44c03c79f80d6d1a2446673bc4d53a2067).
 
 # 0.7.0
 

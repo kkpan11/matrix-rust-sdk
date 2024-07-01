@@ -19,6 +19,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use growable_bloom_filter::GrowableBloom;
 use matrix_sdk_common::{instant::Instant, ring_buffer::RingBuffer};
 use ruma::{
     canonical_json::{redact, RedactedBecause},
@@ -30,12 +31,15 @@ use ruma::{
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId,
-    RoomId, RoomVersionId, UserId,
+    CanonicalJsonObject, EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId,
+    OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
 use tracing::{debug, warn};
 
-use super::{Result, RoomInfo, StateChanges, StateStore, StoreError};
+use super::{
+    traits::{ComposerDraft, QueuedEvent, SerializableEventContent},
+    Result, RoomInfo, StateChanges, StateStore, StoreError,
+};
 use crate::{
     deserialized_responses::RawAnySyncOrStrippedState,
     media::{MediaRequest, UniqueKey as _},
@@ -48,9 +52,12 @@ use crate::{
 #[allow(clippy::type_complexity)]
 #[derive(Debug)]
 pub struct MemoryStore {
-    user_avatar_url: StdRwLock<HashMap<String, String>>,
+    recently_visited_rooms: StdRwLock<HashMap<OwnedUserId, Vec<OwnedRoomId>>>,
+    composer_drafts: StdRwLock<HashMap<OwnedRoomId, ComposerDraft>>,
+    user_avatar_url: StdRwLock<HashMap<OwnedUserId, OwnedMxcUri>>,
     sync_token: StdRwLock<Option<String>>,
     filters: StdRwLock<HashMap<String, String>>,
+    utd_hook_manager_data: StdRwLock<Option<GrowableBloom>>,
     account_data: StdRwLock<HashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>>,
     profiles: StdRwLock<HashMap<OwnedRoomId, HashMap<OwnedUserId, MinimalRoomMemberEvent>>>,
     display_names: StdRwLock<HashMap<OwnedRoomId, HashMap<String, BTreeSet<OwnedUserId>>>>,
@@ -81,6 +88,7 @@ pub struct MemoryStore {
     >,
     media: StdRwLock<RingBuffer<(OwnedMxcUri, String /* unique key */, Vec<u8>)>>,
     custom: StdRwLock<HashMap<Vec<u8>, Vec<u8>>>,
+    send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<QueuedEvent>>>,
 }
 
 // SAFETY: `new_unchecked` is safe because 20 is not zero.
@@ -89,9 +97,12 @@ const NUMBER_OF_MEDIAS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20) 
 impl Default for MemoryStore {
     fn default() -> Self {
         Self {
+            recently_visited_rooms: Default::default(),
+            composer_drafts: Default::default(),
             user_avatar_url: Default::default(),
             sync_token: Default::default(),
             filters: Default::default(),
+            utd_hook_manager_data: Default::default(),
             account_data: Default::default(),
             profiles: Default::default(),
             display_names: Default::default(),
@@ -106,6 +117,7 @@ impl Default for MemoryStore {
             room_event_receipts: Default::default(),
             media: StdRwLock::new(RingBuffer::new(NUMBER_OF_MEDIAS)),
             custom: Default::default(),
+            send_queue_events: Default::default(),
         }
     }
 }
@@ -174,9 +186,29 @@ impl StateStore for MemoryStore {
                 .user_avatar_url
                 .read()
                 .unwrap()
-                .get(user_id.as_str())
+                .get(user_id)
                 .cloned()
                 .map(StateStoreDataValue::UserAvatarUrl),
+            StateStoreDataKey::RecentlyVisitedRooms(user_id) => self
+                .recently_visited_rooms
+                .read()
+                .unwrap()
+                .get(user_id)
+                .cloned()
+                .map(StateStoreDataValue::RecentlyVisitedRooms),
+            StateStoreDataKey::UtdHookManagerData => self
+                .utd_hook_manager_data
+                .read()
+                .unwrap()
+                .clone()
+                .map(StateStoreDataValue::UtdHookManagerData),
+            StateStoreDataKey::ComposerDraft(room_id) => self
+                .composer_drafts
+                .read()
+                .unwrap()
+                .get(room_id)
+                .cloned()
+                .map(StateStoreDataValue::ComposerDraft),
         })
     }
 
@@ -197,9 +229,30 @@ impl StateStore for MemoryStore {
                 );
             }
             StateStoreDataKey::UserAvatarUrl(user_id) => {
-                self.filters.write().unwrap().insert(
-                    user_id.to_string(),
+                self.user_avatar_url.write().unwrap().insert(
+                    user_id.to_owned(),
                     value.into_user_avatar_url().expect("Session data not a user avatar url"),
+                );
+            }
+            StateStoreDataKey::RecentlyVisitedRooms(user_id) => {
+                self.recently_visited_rooms.write().unwrap().insert(
+                    user_id.to_owned(),
+                    value
+                        .into_recently_visited_rooms()
+                        .expect("Session data not a list of recently visited rooms"),
+                );
+            }
+            StateStoreDataKey::UtdHookManagerData => {
+                *self.utd_hook_manager_data.write().unwrap() = Some(
+                    value
+                        .into_utd_hook_manager_data()
+                        .expect("Session data not the hook manager data"),
+                );
+            }
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                self.composer_drafts.write().unwrap().insert(
+                    room_id.to_owned(),
+                    value.into_composer_draft().expect("Session data not a composer draft"),
                 );
             }
         }
@@ -214,7 +267,16 @@ impl StateStore for MemoryStore {
                 self.filters.write().unwrap().remove(filter_name);
             }
             StateStoreDataKey::UserAvatarUrl(user_id) => {
-                self.filters.write().unwrap().remove(user_id.as_str());
+                self.user_avatar_url.write().unwrap().remove(user_id);
+            }
+            StateStoreDataKey::RecentlyVisitedRooms(user_id) => {
+                self.recently_visited_rooms.write().unwrap().remove(user_id);
+            }
+            StateStoreDataKey::UtdHookManagerData => {
+                *self.utd_hook_manager_data.write().unwrap() = None
+            }
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                self.composer_drafts.write().unwrap().remove(room_id);
             }
         }
         Ok(())
@@ -227,14 +289,25 @@ impl StateStore for MemoryStore {
             *self.sync_token.write().unwrap() = Some(s.to_owned());
         }
 
-        for (room, users) in &changes.profiles {
-            for (user_id, profile) in users {
-                self.profiles
-                    .write()
-                    .unwrap()
-                    .entry(room.clone())
-                    .or_default()
-                    .insert(user_id.clone(), profile.clone());
+        {
+            let mut profiles = self.profiles.write().unwrap();
+
+            for (room, users) in &changes.profiles_to_delete {
+                let Some(room_profiles) = profiles.get_mut(room) else {
+                    continue;
+                };
+                for user in users {
+                    room_profiles.remove(user);
+                }
+            }
+
+            for (room, users) in &changes.profiles {
+                for (user_id, profile) in users {
+                    profiles
+                        .entry(room.clone())
+                        .or_default()
+                        .insert(user_id.clone(), profile.clone());
+                }
             }
         }
 
@@ -795,6 +868,98 @@ impl StateStore for MemoryStore {
         self.room_event_receipts.write().unwrap().remove(room_id);
 
         Ok(())
+    }
+
+    async fn save_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        event: SerializableEventContent,
+    ) -> Result<(), Self::Error> {
+        self.send_queue_events
+            .write()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .push(QueuedEvent { event, transaction_id, is_wedged: false });
+        Ok(())
+    }
+
+    async fn update_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: SerializableEventContent,
+    ) -> Result<bool, Self::Error> {
+        if let Some(entry) = self
+            .send_queue_events
+            .write()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .iter_mut()
+            .find(|item| item.transaction_id == transaction_id)
+        {
+            entry.event = content;
+            entry.is_wedged = false;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn remove_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error> {
+        let mut q = self.send_queue_events.write().unwrap();
+
+        let entry = q.get_mut(room_id);
+        if let Some(entry) = entry {
+            // Find the event by id in its room queue, and remove it if present.
+            if let Some(pos) = entry.iter().position(|item| item.transaction_id == transaction_id) {
+                entry.remove(pos);
+                // And if this was the last event before removal, remove the entire room entry.
+                if entry.is_empty() {
+                    q.remove(room_id);
+                }
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn load_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedEvent>, Self::Error> {
+        Ok(self.send_queue_events.write().unwrap().entry(room_id.to_owned()).or_default().clone())
+    }
+
+    async fn update_send_queue_event_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        wedged: bool,
+    ) -> Result<(), Self::Error> {
+        if let Some(entry) = self
+            .send_queue_events
+            .write()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .iter_mut()
+            .find(|item| item.transaction_id == transaction_id)
+        {
+            entry.is_wedged = wedged;
+        }
+        Ok(())
+    }
+
+    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        Ok(self.send_queue_events.read().unwrap().keys().cloned().collect())
     }
 }
 

@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use as_variant::as_variant;
 use indexmap::IndexMap;
 use matrix_sdk::{deserialized_responses::EncryptionInfo, Client, Error};
 use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent};
@@ -44,6 +45,7 @@ pub(super) use self::{
     local::LocalEventTimelineItem,
     remote::{RemoteEventOrigin, RemoteEventTimelineItem},
 };
+use super::{EditInfo, RepliedToInfo, ReplyContent, UnsupportedEditItem, UnsupportedReplyItem};
 
 /// An item in the timeline that represents at least one event.
 ///
@@ -74,7 +76,7 @@ pub(super) enum EventTimelineItemKind {
 
 /// A wrapper that can contain either a transaction id, or an event id.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum EventItemIdentifier {
+pub enum TimelineEventItemId {
     /// The item is local, identified by its transaction id (to be used in
     /// subsequent requests).
     TransactionId(OwnedTransactionId),
@@ -180,44 +182,45 @@ impl EventTimelineItem {
 
     /// Get the `LocalEventTimelineItem` if `self` is `Local`.
     pub(super) fn as_local(&self) -> Option<&LocalEventTimelineItem> {
-        match &self.kind {
-            EventTimelineItemKind::Local(local_event_item) => Some(local_event_item),
-            EventTimelineItemKind::Remote(_) => None,
-        }
+        as_variant!(&self.kind, EventTimelineItemKind::Local(local_event_item) => local_event_item)
     }
 
-    /// Get the `RemoteEventTimelineItem` if `self` is `Remote`.
+    /// Get a reference to a [`RemoteEventTimelineItem`] if it's a remote echo.
     pub(super) fn as_remote(&self) -> Option<&RemoteEventTimelineItem> {
-        match &self.kind {
-            EventTimelineItemKind::Local(_) => None,
-            EventTimelineItemKind::Remote(remote_event_item) => Some(remote_event_item),
-        }
+        as_variant!(&self.kind, EventTimelineItemKind::Remote(remote_event_item) => remote_event_item)
     }
 
+    /// Get a mutable reference to a [`RemoteEventTimelineItem`] if it's a
+    /// remote echo.
     pub(super) fn as_remote_mut(&mut self) -> Option<&mut RemoteEventTimelineItem> {
-        match &mut self.kind {
-            EventTimelineItemKind::Local(_) => None,
-            EventTimelineItemKind::Remote(remote_event_item) => Some(remote_event_item),
-        }
+        as_variant!(&mut self.kind, EventTimelineItemKind::Remote(remote_event_item) => remote_event_item)
     }
 
-    /// Get the event's send state, if it is a local echo.
+    /// Get the event's send state of a local echo.
     pub fn send_state(&self) -> Option<&EventSendState> {
+        as_variant!(&self.kind, EventTimelineItemKind::Local(local) => &local.send_state)
+    }
+
+    /// Get the unique identifier of this item.
+    ///
+    /// Returns the transaction ID for a local echo item that has not been sent
+    /// and the event ID for a local echo item that has been sent or a
+    /// remote item.
+    pub(crate) fn identifier(&self) -> TimelineEventItemId {
         match &self.kind {
-            EventTimelineItemKind::Local(local) => Some(&local.send_state),
-            EventTimelineItemKind::Remote(_) => None,
+            EventTimelineItemKind::Local(local) => local.identifier(),
+            EventTimelineItemKind::Remote(remote) => {
+                TimelineEventItemId::EventId(remote.event_id.clone())
+            }
         }
     }
 
-    /// Get the transaction ID of this item.
+    /// Get the transaction ID of a local echo item.
     ///
     /// The transaction ID is currently only kept until the remote echo for a
     /// local event is received.
     pub fn transaction_id(&self) -> Option<&TransactionId> {
-        match &self.kind {
-            EventTimelineItemKind::Local(local) => Some(&local.transaction_id),
-            EventTimelineItemKind::Remote(_) => None,
-        }
+        as_variant!(&self.kind, EventTimelineItemKind::Local(local) => &local.transaction_id)
     }
 
     /// Get the event ID of this item.
@@ -291,17 +294,27 @@ impl EventTimelineItem {
         }
     }
 
-    /// Flag indicating this timeline item can be edited by current user.
+    /// Flag indicating this timeline item can be edited by the current user.
     pub fn is_editable(&self) -> bool {
+        // Steps here should be in sync with [`EventTimelineItem::edit_info`] and
+        // [`Timeline::edit_poll`].
+
+        if !self.is_own() {
+            // In theory could work, but it's hard to compute locally.
+            return false;
+        }
+
         match self.content() {
             TimelineItemContent::Message(message) => {
-                self.is_own()
-                    && matches!(message.msgtype(), MessageType::Text(_) | MessageType::Emote(_))
+                matches!(message.msgtype(), MessageType::Text(_) | MessageType::Emote(_))
             }
             TimelineItemContent::Poll(poll) => {
-                self.is_own() && poll.response_data.is_empty() && poll.end_event_timestamp.is_none()
+                poll.response_data.is_empty() && poll.end_event_timestamp.is_none()
             }
-            _ => false,
+            _ => {
+                // Other timeline items can't be edited at the moment.
+                false
+            }
         }
     }
 
@@ -331,15 +344,6 @@ impl EventTimelineItem {
         } else {
             self.latest_json().is_some()
         }
-    }
-
-    /// Check whether this item can be edited.
-    ///
-    /// Please also check whether the `sender` of this event is the client's
-    /// current user before presenting an edit button in the UI.
-    pub fn can_be_edited(&self) -> bool {
-        // This must be in sync with the early returns of `Timeline::edit`
-        self.event_id().is_some() && self.content().as_message().is_some()
     }
 
     /// Get the raw JSON representation of the initial event (the one that
@@ -414,6 +418,7 @@ impl EventTimelineItem {
         Self { sender_profile, ..self.clone() }
     }
 
+    /// Create a clone of the current item, with content that's been redacted.
     pub(super) fn redact(&self, room_version: &RoomVersionId) -> Self {
         let content = self.content.redact(room_version);
         let kind = match &self.kind {
@@ -427,6 +432,45 @@ impl EventTimelineItem {
             content,
             kind,
         }
+    }
+
+    /// Gives the information needed to reply to the event of the item.
+    pub fn replied_to_info(&self) -> Result<RepliedToInfo, UnsupportedReplyItem> {
+        let reply_content = match self.content() {
+            TimelineItemContent::Message(msg) => ReplyContent::Message(msg.to_owned()),
+            _ => {
+                let Some(raw_event) = self.latest_json() else {
+                    return Err(UnsupportedReplyItem::MissingJson);
+                };
+
+                ReplyContent::Raw(raw_event.clone())
+            }
+        };
+
+        let Some(event_id) = self.event_id() else {
+            return Err(UnsupportedReplyItem::MissingEventId);
+        };
+
+        Ok(RepliedToInfo {
+            event_id: event_id.to_owned(),
+            sender: self.sender().to_owned(),
+            timestamp: self.timestamp(),
+            content: reply_content,
+        })
+    }
+
+    /// Gives the information needed to edit the event of the item.
+    pub fn edit_info(&self) -> Result<EditInfo, UnsupportedEditItem> {
+        // Steps here should be in sync with [`EventTimelineItem::is_editable`].
+        if !self.is_own() {
+            return Err(UnsupportedEditItem::NotOwnEvent);
+        }
+
+        let TimelineItemContent::Message(original_content) = self.content() else {
+            return Err(UnsupportedEditItem::NotRoomMessage);
+        };
+
+        Ok(EditInfo { id: self.identifier(), original_message: original_content.clone() })
     }
 }
 
@@ -578,7 +622,7 @@ mod tests {
         room.timeline.push(member_event(room_id, user_id, "Alice Margatroid", "mxc://e.org/SEs"));
 
         // And the room is stored in the client so it can be extracted when needed
-        let response = response_with_room(room_id, room).await;
+        let response = response_with_room(room_id, room);
         client.process_sliding_sync_test_helper(&response).await.unwrap();
 
         // When we construct a timeline event from it
@@ -622,7 +666,7 @@ mod tests {
         // `StateChanges`.
 
         // And the room is stored in the client so it can be extracted when needed
-        let response = response_with_room(room_id, room).await;
+        let response = response_with_room(room_id, room);
         client.process_sliding_sync_test_helper(&response).await.unwrap();
 
         // When we construct a timeline event from it
@@ -672,7 +716,7 @@ mod tests {
         })
     }
 
-    async fn response_with_room(room_id: &RoomId, room: v4::SlidingSyncRoom) -> v4::Response {
+    fn response_with_room(room_id: &RoomId, room: v4::SlidingSyncRoom) -> v4::Response {
         let mut response = v4::Response::new("6".to_owned());
         response.rooms.insert(room_id.to_owned(), room);
         response

@@ -38,7 +38,7 @@ use crate::http_client::HttpSettings;
 use crate::oidc::OidcCtx;
 use crate::{
     authentication::AuthCtx, config::RequestConfig, error::RumaApiError, http_client::HttpClient,
-    HttpError, IdParseError,
+    send_queue::SendQueueData, HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -84,6 +84,8 @@ use crate::{
 pub struct ClientBuilder {
     homeserver_cfg: Option<HomeserverConfig>,
     #[cfg(feature = "experimental-sliding-sync")]
+    requires_sliding_sync: bool,
+    #[cfg(feature = "experimental-sliding-sync")]
     sliding_sync_proxy: Option<String>,
     http_cfg: Option<HttpConfig>,
     store_config: BuilderStoreConfig,
@@ -100,6 +102,8 @@ impl ClientBuilder {
     pub(crate) fn new() -> Self {
         Self {
             homeserver_cfg: None,
+            #[cfg(feature = "experimental-sliding-sync")]
+            requires_sliding_sync: false,
             #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_proxy: None,
             http_cfg: None,
@@ -124,6 +128,18 @@ impl ClientBuilder {
     /// If you set more than one, then whatever was set last will be used.
     pub fn homeserver_url(mut self, url: impl AsRef<str>) -> Self {
         self.homeserver_cfg = Some(HomeserverConfig::Url(url.as_ref().to_owned()));
+        self
+    }
+
+    /// Ensures that the client is built with support for sliding-sync, either
+    /// by discovering a proxy through the homeserver's well-known or by
+    /// providing one through [`Self::sliding_sync_proxy`].
+    ///
+    /// In the future this may also perform a check for native support on the
+    /// homeserver.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn requires_sliding_sync(mut self) -> Self {
+        self.requires_sliding_sync = true;
         self
     }
 
@@ -424,8 +440,6 @@ impl ClientBuilder {
         };
 
         #[cfg(feature = "experimental-oidc")]
-        let mut authentication_server_info = None;
-        #[cfg(feature = "experimental-oidc")]
         let allow_insecure_oidc = homeserver.starts_with("http://");
 
         #[cfg(feature = "experimental-sliding-sync")]
@@ -434,16 +448,17 @@ impl ClientBuilder {
 
         #[allow(unused_variables)]
         if let Some(well_known) = well_known {
-            #[cfg(feature = "experimental-oidc")]
-            {
-                authentication_server_info = well_known.authentication;
-            }
-
             #[cfg(feature = "experimental-sliding-sync")]
             if sliding_sync_proxy.is_none() {
                 sliding_sync_proxy =
                     well_known.sliding_sync_proxy.and_then(|p| Url::parse(&p.url).ok())
             }
+        }
+
+        #[cfg(feature = "experimental-sliding-sync")]
+        if self.requires_sliding_sync && sliding_sync_proxy.is_none() {
+            // In the future we will need to check for native support on the homeserver too.
+            return Err(ClientBuildError::SlidingSyncNotAvailable);
         }
 
         let homeserver = Url::parse(&homeserver)?;
@@ -456,8 +471,11 @@ impl ClientBuilder {
             reload_session_callback: OnceCell::default(),
             save_session_callback: OnceCell::default(),
             #[cfg(feature = "experimental-oidc")]
-            oidc: OidcCtx::new(authentication_server_info, allow_insecure_oidc),
+            oidc: OidcCtx::new(allow_insecure_oidc),
         });
+
+        // Enable the send queue by default.
+        let send_queue = Arc::new(SendQueueData::new(true));
 
         let event_cache = OnceCell::new();
         let inner = ClientInner::new(
@@ -471,6 +489,7 @@ impl ClientBuilder {
             None,
             self.respect_login_well_known,
             event_cache,
+            send_queue,
             #[cfg(feature = "e2e-encryption")]
             self.encryption_settings,
         )
@@ -594,6 +613,7 @@ async fn check_is_homeserver(homeserver_url: &Url, http_client: &HttpClient) -> 
     }
 }
 
+#[allow(clippy::unused_async)] // False positive when building with !sqlite & !indexeddb
 async fn build_store_config(
     builder_config: BuilderStoreConfig,
 ) -> Result<StoreConfig, ClientBuildError> {
@@ -750,6 +770,10 @@ pub enum ClientBuildError {
     #[error("Error looking up the .well-known endpoint on auto-discovery")]
     AutoDiscovery(FromHttpResponseError<RumaApiError>),
 
+    /// The builder requires support for sliding sync but it isn't available.
+    #[error("The homeserver doesn't support sliding sync and a custom proxy wasn't configured.")]
+    SlidingSyncNotAvailable,
+
     /// An error encountered when trying to parse the homeserver url.
     #[error(transparent)]
     Url(#[from] url::ParseError),
@@ -876,8 +900,6 @@ pub(crate) mod tests {
         // Then a client should be built without support for sliding sync or OIDC.
         #[cfg(feature = "experimental-sliding-sync")]
         assert!(_client.sliding_sync_proxy().is_none());
-        #[cfg(feature = "experimental-oidc")]
-        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -898,8 +920,6 @@ pub(crate) mod tests {
         // Then a client should be built with support for sliding sync.
         #[cfg(feature = "experimental-sliding-sync")]
         assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
-        #[cfg(feature = "experimental-oidc")]
-        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -909,7 +929,7 @@ pub(crate) mod tests {
         let homeserver = make_mock_homeserver().await;
         let mut builder = ClientBuilder::new();
 
-        let well_known = make_well_known_json(&homeserver.uri(), None, None);
+        let well_known = make_well_known_json(&homeserver.uri(), None);
         let bad_json = well_known.to_string().replace(',', "");
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
@@ -938,11 +958,10 @@ pub(crate) mod tests {
 
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
-                &homeserver.uri(),
-                None,
-                None,
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_well_known_json(&homeserver.uri(), None)),
+            )
             .mount(&server)
             .await;
 
@@ -953,8 +972,6 @@ pub(crate) mod tests {
         // Then a client should be built without support for sliding sync or OIDC.
         #[cfg(feature = "experimental-sliding-sync")]
         assert!(_client.sliding_sync_proxy().is_none());
-        #[cfg(feature = "experimental-oidc")]
-        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -970,7 +987,6 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
                 &homeserver.uri(),
                 Some("https://localhost:1234"),
-                None,
             )))
             .mount(&server)
             .await;
@@ -982,8 +998,6 @@ pub(crate) mod tests {
         // Then a client should be built with support for sliding sync.
         #[cfg(feature = "experimental-sliding-sync")]
         assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
-        #[cfg(feature = "experimental-oidc")]
-        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -1000,7 +1014,6 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
                 &homeserver.uri(),
                 Some("https://localhost:1234"),
-                None,
             )))
             .mount(&server)
             .await;
@@ -1015,14 +1028,41 @@ pub(crate) mod tests {
         // proxy.
         #[cfg(feature = "experimental-sliding-sync")]
         assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:9012".parse().unwrap()));
-        #[cfg(feature = "experimental-oidc")]
-        assert!(client.oidc().authentication_server_info().is_none());
+    }
+
+    /* Requires sliding sync */
+
+    #[async_test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_requires_sliding_sync_with_legacy_well_known() {
+        // Given a base server with a well-known file that points to a homeserver that
+        // doesn't support sliding sync.
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(make_well_known_json(&homeserver.uri(), None)),
+            )
+            .mount(&server)
+            .await;
+
+        // When building a client that requires sliding sync with the base server.
+        builder = builder.requires_sliding_sync().server_name_or_homeserver_url(server.uri());
+        let error = builder.build().await.unwrap_err();
+
+        // Then the operation should fail due to the lack of sliding sync support.
+        assert_matches!(error, ClientBuildError::SlidingSyncNotAvailable);
     }
 
     #[async_test]
-    async fn test_discovery_well_known_matrix2point0() {
-        // Given a base server with a well-known file that points to a homeserver that
-        // is Matrix 2.0 ready (OIDC & Sliding Sync).
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_requires_sliding_sync_with_well_known() {
+        // Given a base server with a well-known file that points to a homeserver with a
+        // sliding sync proxy.
         let server = MockServer::start().await;
         let homeserver = make_mock_homeserver().await;
         let mut builder = ClientBuilder::new();
@@ -1032,23 +1072,33 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
                 &homeserver.uri(),
                 Some("https://localhost:1234"),
-                Some("https://localhost:5678"),
             )))
             .mount(&server)
             .await;
 
-        // When building a client with the base server.
-        builder = builder.server_name_or_homeserver_url(server.uri());
+        // When building a client that requires sliding sync with the base server.
+        builder = builder.requires_sliding_sync().server_name_or_homeserver_url(server.uri());
         let _client = builder.build().await.unwrap();
 
-        // Then a client should be built with support for both sliding sync and OIDC.
-        #[cfg(feature = "experimental-sliding-sync")]
+        // Then a client should be built with support for sliding sync.
         assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
-        #[cfg(feature = "experimental-oidc")]
-        assert_eq!(
-            _client.oidc().authentication_server_info().unwrap().issuer,
-            "https://localhost:5678".to_owned()
-        );
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_requires_sliding_sync_with_custom_proxy() {
+        // Given a homeserver without a well-known file and with a custom sliding sync
+        // proxy injected.
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+        builder = builder.sliding_sync_proxy("https://localhost:1234");
+
+        // When building a client that requires sliding sync with the server's URL.
+        builder = builder.requires_sliding_sync().server_name_or_homeserver_url(homeserver.uri());
+        let _client = builder.build().await.unwrap();
+
+        // Then a client should be built with support for sliding sync.
+        assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
     }
 
     /* Helper functions */
@@ -1071,7 +1121,6 @@ pub(crate) mod tests {
     fn make_well_known_json(
         homeserver_url: &str,
         sliding_sync_proxy_url: Option<&str>,
-        authentication_issuer: Option<&str>,
     ) -> JsonValue {
         ::serde_json::Value::Object({
             let mut object = ::serde_json::Map::new();
@@ -1087,16 +1136,6 @@ pub(crate) mod tests {
                     "org.matrix.msc3575.proxy".into(),
                     json_internal!({
                         "url": sliding_sync_proxy_url
-                    }),
-                );
-            }
-
-            if let Some(authentication_issuer) = authentication_issuer {
-                let _ = object.insert(
-                    "org.matrix.msc2965.authentication".into(),
-                    json_internal!({
-                        "issuer": authentication_issuer,
-                        "account": authentication_issuer.to_owned() + "/account"
                     }),
                 );
             }

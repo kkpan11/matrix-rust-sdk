@@ -14,7 +14,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    convert::{TryFrom, TryInto},
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -44,7 +43,9 @@ use crate::{
     olm::{
         InboundGroupSession, OutboundGroupSession, Session, ShareInfo, SignedJsonObject, VerifyJson,
     },
-    store::{Changes, CryptoStoreWrapper, DeviceChanges, Result as StoreResult},
+    store::{
+        caches::SequenceNumber, Changes, CryptoStoreWrapper, DeviceChanges, Result as StoreResult,
+    },
     types::{
         events::{
             forwarded_room_key::ForwardedRoomKeyContent,
@@ -90,6 +91,10 @@ pub struct ReadOnlyDevice {
     /// Default to epoch for migration purpose.
     #[serde(default = "default_timestamp")]
     first_time_seen_ts: MilliSecondsSinceUnixEpoch,
+    /// The number of times the device has tried to unwedge Olm sessions with
+    /// us.
+    #[serde(default)]
+    pub(crate) olm_wedging_index: SequenceNumber,
 }
 
 fn default_timestamp() -> MilliSecondsSinceUnixEpoch {
@@ -302,8 +307,8 @@ impl Device {
     ///
     /// Returns a `VerificationRequest` object and a to-device request that
     /// needs to be sent out.
-    pub async fn request_verification(&self) -> (VerificationRequest, OutgoingVerificationRequest) {
-        self.request_verification_helper(None).await
+    pub fn request_verification(&self) -> (VerificationRequest, OutgoingVerificationRequest) {
+        self.request_verification_helper(None)
     }
 
     /// Request an interactive verification with this `Device`.
@@ -314,24 +319,22 @@ impl Device {
     /// # Arguments
     ///
     /// * `methods` - The verification methods that we want to support.
-    pub async fn request_verification_with_methods(
+    pub fn request_verification_with_methods(
         &self,
         methods: Vec<VerificationMethod>,
     ) -> (VerificationRequest, OutgoingVerificationRequest) {
-        self.request_verification_helper(Some(methods)).await
+        self.request_verification_helper(Some(methods))
     }
 
-    async fn request_verification_helper(
+    fn request_verification_helper(
         &self,
         methods: Option<Vec<VerificationMethod>>,
     ) -> (VerificationRequest, OutgoingVerificationRequest) {
-        self.verification_machine
-            .request_to_device_verification(
-                self.user_id(),
-                vec![self.device_id().to_owned()],
-                methods,
-            )
-            .await
+        self.verification_machine.request_to_device_verification(
+            self.user_id(),
+            vec![self.device_id().to_owned()],
+            methods,
+        )
     }
 
     /// Get the Olm sessions that belong to this device.
@@ -583,6 +586,7 @@ impl ReadOnlyDevice {
             deleted: Arc::new(AtomicBool::new(false)),
             withheld_code_sent: Arc::new(AtomicBool::new(false)),
             first_time_seen_ts: MilliSecondsSinceUnixEpoch::now(),
+            olm_wedging_index: Default::default(),
         }
     }
 
@@ -791,7 +795,6 @@ impl ReadOnlyDevice {
             recipient_device = ?self.device_id(),
             recipient_key = ?self.curve25519_key(),
             event_type,
-            session,
             message_id,
         ))
     ]
@@ -819,7 +822,6 @@ impl ReadOnlyDevice {
 
         if let Some(mut session) = session {
             let message = session.encrypt(self, event_type, content, message_id).await?;
-            trace!("Successfully encrypted an event");
             Ok((session, message))
         } else {
             trace!("Trying to encrypt an event for a device, but no Olm session is found.");
@@ -838,7 +840,11 @@ impl ReadOnlyDevice {
 
         match self.encrypt(store, event_type, content).await {
             Ok((session, encrypted)) => Ok(MaybeEncryptedRoomKey::Encrypted {
-                share_info: ShareInfo::new_shared(session.sender_key().to_owned(), message_index),
+                share_info: ShareInfo::new_shared(
+                    session.sender_key().to_owned(),
+                    message_index,
+                    self.olm_wedging_index,
+                ),
                 used_session: session,
                 message: encrypted.cast(),
             }),
@@ -851,7 +857,12 @@ impl ReadOnlyDevice {
     }
 
     /// Update a device with a new device keys struct.
-    pub(crate) fn update_device(&mut self, device_keys: &DeviceKeys) -> Result<(), SignatureError> {
+    ///
+    /// Returns `true` if any changes were made to the data.
+    pub(crate) fn update_device(
+        &mut self,
+        device_keys: &DeviceKeys,
+    ) -> Result<bool, SignatureError> {
         self.verify_device_keys(device_keys)?;
 
         if self.user_id() != device_keys.user_id || self.device_id() != device_keys.device_id {
@@ -861,14 +872,18 @@ impl ReadOnlyDevice {
                 self.ed25519_key().map(Box::new),
                 device_keys.ed25519_key().map(Box::new),
             ))
-        } else {
+        } else if self.inner.as_ref() != device_keys {
             self.inner = device_keys.clone().into();
 
-            Ok(())
+            Ok(true)
+        } else {
+            // no changes needed
+            Ok(false)
         }
     }
 
-    pub(crate) fn as_device_keys(&self) -> &DeviceKeys {
+    /// Return the device keys
+    pub fn as_device_keys(&self) -> &DeviceKeys {
         &self.inner
     }
 
@@ -967,6 +982,7 @@ impl TryFrom<&DeviceKeys> for ReadOnlyDevice {
             trust_state: Arc::new(RwLock::new(LocalTrust::Unset)),
             withheld_code_sent: Arc::new(AtomicBool::new(false)),
             first_time_seen_ts: MilliSecondsSinceUnixEpoch::now(),
+            olm_wedging_index: Default::default(),
         };
 
         device.verify_device_keys(device_keys)?;
@@ -980,10 +996,10 @@ impl PartialEq for ReadOnlyDevice {
     }
 }
 
+/// Testing Facilities for Device Management
 #[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
 pub(crate) mod testing {
-    //! Testing Facilities for Device Management
-    #![allow(dead_code)]
     use serde_json::json;
 
     use crate::{identities::ReadOnlyDevice, types::DeviceKeys};
@@ -1069,9 +1085,11 @@ pub(crate) mod tests {
 
         let mut device_keys = device_keys();
         device_keys.unsigned.device_display_name = Some(display_name.clone());
-        device.update_device(&device_keys).unwrap();
-
+        assert!(device.update_device(&device_keys).unwrap());
         assert_eq!(&display_name, device.display_name().as_ref().unwrap());
+
+        // A second call to `update_device` with the same data should return `false`.
+        assert!(!device.update_device(&device_keys).unwrap());
     }
 
     #[test]

@@ -16,9 +16,9 @@ use matrix_sdk_ui::{
     room_list_service::{
         filters::{
             new_filter_all, new_filter_any, new_filter_category, new_filter_favourite,
-            new_filter_fuzzy_match_room_name, new_filter_invite, new_filter_non_left,
-            new_filter_none, new_filter_normalized_match_room_name, new_filter_unread,
-            RoomCategory,
+            new_filter_fuzzy_match_room_name, new_filter_invite, new_filter_joined,
+            new_filter_non_left, new_filter_none, new_filter_normalized_match_room_name,
+            new_filter_unread, RoomCategory,
         },
         BoxedFilterFn,
     },
@@ -129,7 +129,7 @@ impl RoomListService {
         let room_id = <&RoomId>::try_from(room_id.as_str()).map_err(RoomListError::from)?;
 
         Ok(Arc::new(RoomListItem {
-            inner: Arc::new(RUNTIME.block_on(async { self.inner.room(room_id).await })?),
+            inner: Arc::new(self.inner.room(room_id)?),
             utd_hook: self.utd_hook.clone(),
         }))
     }
@@ -138,13 +138,6 @@ impl RoomListService {
         Ok(Arc::new(RoomList {
             room_list_service: self.clone(),
             inner: Arc::new(self.inner.all_rooms().await.map_err(RoomListError::from)?),
-        }))
-    }
-
-    async fn invites(self: Arc<Self>) -> Result<Arc<RoomList>, RoomListError> {
-        Ok(Arc::new(RoomList {
-            room_list_service: self.clone(),
-            inner: Arc::new(self.inner.invites().await.map_err(RoomListError::from)?),
         }))
     }
 
@@ -423,6 +416,7 @@ pub enum RoomListEntriesDynamicFilterKind {
     All { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Any { filters: Vec<RoomListEntriesDynamicFilterKind> },
     NonLeft,
+    Joined,
     Unread,
     Favourite,
     Invite,
@@ -463,6 +457,7 @@ impl FilterWrapper {
                 filters.into_iter().map(|filter| FilterWrapper::from(client, filter).0).collect(),
             ))),
             Kind::NonLeft => Self(Box::new(new_filter_non_left(client))),
+            Kind::Joined => Self(Box::new(new_filter_joined(client))),
             Kind::Unread => Self(Box::new(new_filter_unread(client))),
             Kind::Favourite => Self(Box::new(new_filter_favourite(client))),
             Kind::Invite => Self(Box::new(new_filter_invite(client))),
@@ -490,8 +485,11 @@ impl RoomListItem {
         self.inner.id().to_string()
     }
 
-    fn name(&self) -> Option<String> {
-        RUNTIME.block_on(async { self.inner.name().await })
+    /// Returns the room's name from the state event if available, otherwise
+    /// compute a room name based on the room's nature (DM or not) and number of
+    /// members.
+    fn display_name(&self) -> Option<String> {
+        self.inner.cached_display_name()
     }
 
     fn avatar_url(&self) -> Option<String> {
@@ -499,7 +497,7 @@ impl RoomListItem {
     }
 
     fn is_direct(&self) -> bool {
-        RUNTIME.block_on(async { self.inner.inner_room().is_direct().await.unwrap_or(false) })
+        RUNTIME.block_on(self.inner.inner_room().is_direct()).unwrap_or(false)
     }
 
     fn canonical_alias(&self) -> Option<String> {
@@ -507,14 +505,13 @@ impl RoomListItem {
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        let avatar_url = self.inner.avatar_url();
-        let latest_event = self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new);
-        Ok(RoomInfo::new(self.inner.inner_room(), avatar_url, latest_event).await?)
+        Ok(RoomInfo::new(self.inner.inner_room()).await?)
     }
 
-    /// Building a `Room`. If its internal timeline hasn't been initialized
-    /// it'll fail.
-    async fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
+    /// Build a full `Room` FFI object, filling its associated timeline.
+    ///
+    /// If its internal timeline hasn't been initialized, it'll fail.
+    fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
         if let Some(timeline) = self.inner.timeline() {
             Ok(Arc::new(Room::with_timeline(
                 self.inner.inner_room().clone(),
@@ -537,9 +534,13 @@ impl RoomListItem {
     /// * `event_type_filter` - An optional [`TimelineEventTypeFilter`] to be
     ///   used to filter timeline events besides the default timeline filter. If
     ///   `None` is passed, only the default timeline filter will be used.
+    /// * `internal_id_prefix` - An optional String that will be prepended to
+    ///   all the timeline item's internal IDs, making it possible to
+    ///   distinguish different timeline instances from each other.
     async fn init_timeline(
         &self,
         event_type_filter: Option<Arc<TimelineEventTypeFilter>>,
+        internal_id_prefix: Option<String>,
     ) -> Result<(), RoomListError> {
         let mut timeline_builder = self
             .inner
@@ -554,11 +555,23 @@ impl RoomListItem {
             });
         }
 
+        if let Some(internal_id_prefix) = internal_id_prefix {
+            timeline_builder = timeline_builder.with_internal_id_prefix(internal_id_prefix);
+        }
+
         if let Some(utd_hook) = self.utd_hook.clone() {
             timeline_builder = timeline_builder.with_unable_to_decrypt_hook(utd_hook);
         }
 
         self.inner.init_timeline_with_builder(timeline_builder).map_err(RoomListError::from).await
+    }
+
+    /// Checks whether the room is encrypted or not.
+    ///
+    /// **Note**: this info may not be reliable if you don't set up
+    /// `m.room.encryption` as required state.
+    async fn is_encrypted(&self) -> bool {
+        self.inner.is_encrypted().await.unwrap_or(false)
     }
 
     fn subscribe(&self, settings: Option<RoomSubscription>) {
@@ -609,6 +622,7 @@ pub struct RequiredState {
 pub struct RoomSubscription {
     pub required_state: Option<Vec<RequiredState>>,
     pub timeline_limit: Option<u32>,
+    pub include_heroes: Option<bool>,
 }
 
 impl From<RoomSubscription> for RumaRoomSubscription {
@@ -617,7 +631,8 @@ impl From<RoomSubscription> for RumaRoomSubscription {
             required_state: val.required_state.map(|r|
                 r.into_iter().map(|s| (s.key.into(), s.value)).collect()
             ).unwrap_or_default(),
-            timeline_limit: val.timeline_limit.map(|u| u.into())
+            timeline_limit: val.timeline_limit.map(|u| u.into()),
+            include_heroes: val.include_heroes,
         })
     }
 }

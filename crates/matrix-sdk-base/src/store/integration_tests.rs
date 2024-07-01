@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use async_trait::async_trait;
+use growable_bloom_filter::GrowableBloomBuilder;
 use matrix_sdk_test::test_json;
 use ruma::{
     api::client::media::get_content_thumbnail::v3::Method,
@@ -17,17 +18,19 @@ use ruma::{
                 MembershipState, RoomMemberEventContent, StrippedRoomMemberEvent,
                 SyncRoomMemberEvent,
             },
+            message::RoomMessageEventContent,
             power_levels::RoomPowerLevelsEventContent,
             topic::RoomTopicEventContent,
             MediaSource,
         },
-        AnyEphemeralRoomEventContent, AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent,
-        AnyStrippedStateEvent, AnySyncEphemeralRoomEvent, AnySyncStateEvent,
-        GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType, SyncStateEvent,
+        AnyEphemeralRoomEventContent, AnyGlobalAccountDataEvent, AnyMessageLikeEventContent,
+        AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncEphemeralRoomEvent,
+        AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
+        SyncStateEvent,
     },
-    mxc_uri, room_id,
+    mxc_uri, owned_mxc_uri, room_id,
     serde::Raw,
-    uint, user_id, EventId, OwnedEventId, OwnedUserId, RoomId, UserId,
+    uint, user_id, EventId, OwnedEventId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde_json::{json, value::Value as JsonValue};
 
@@ -35,14 +38,14 @@ use super::DynStateStore;
 use crate::{
     deserialized_responses::MemberEvent,
     media::{MediaFormat, MediaRequest, MediaThumbnailSize},
-    store::{Result, StateStoreExt},
+    store::{Result, SerializableEventContent, StateStoreExt},
     RoomInfo, RoomMemberships, RoomState, StateChanges, StateStoreDataKey, StateStoreDataValue,
 };
 
 /// `StateStore` integration tests.
 ///
-/// This trait is not meant to be used directly, but will be used with the [``]
-/// macro.
+/// This trait is not meant to be used directly, but will be used with the
+/// [`statestore_integration_tests!`] macro.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait StateStoreIntegrationTests {
@@ -58,8 +61,12 @@ pub trait StateStoreIntegrationTests {
     async fn test_member_saving(&self);
     /// Test filter saving.
     async fn test_filter_saving(&self);
+    /// Test saving a user avatar URL.
+    async fn test_user_avatar_url_saving(&self);
     /// Test sync token saving.
     async fn test_sync_token_saving(&self);
+    /// Test UtdHookManagerData saving.
+    async fn test_utd_hook_manager_data_saving(&self);
     /// Test stripped room member saving.
     async fn test_stripped_member_saving(&self);
     /// Test room power levels saving.
@@ -74,10 +81,14 @@ pub trait StateStoreIntegrationTests {
     async fn test_stripped_non_stripped(&self) -> Result<()>;
     /// Test room removal.
     async fn test_room_removal(&self) -> Result<()>;
+    /// Test profile removal.
+    async fn test_profile_removal(&self) -> Result<()>;
     /// Test presence saving.
     async fn test_presence_saving(&self);
     /// Test display names saving.
     async fn test_display_names_saving(&self);
+    /// Test operations with the send queue.
+    async fn test_send_queue(&self);
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -535,6 +546,30 @@ impl StateStoreIntegrationTests for DynStateStore {
         assert_matches!(self.get_kv_data(StateStoreDataKey::Filter(filter_name)).await, Ok(None));
     }
 
+    async fn test_user_avatar_url_saving(&self) {
+        let user_id = user_id!("@alice:example.org");
+        let url = owned_mxc_uri!("mxc://example.org/poiuyt098");
+
+        self.set_kv_data(
+            StateStoreDataKey::UserAvatarUrl(user_id),
+            StateStoreDataValue::UserAvatarUrl(url.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_let!(
+            Ok(Some(StateStoreDataValue::UserAvatarUrl(stored_url))) =
+                self.get_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await
+        );
+        assert_eq!(stored_url, url);
+
+        self.remove_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await.unwrap();
+        assert_matches!(
+            self.get_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await,
+            Ok(None)
+        );
+    }
+
     async fn test_sync_token_saving(&self) {
         let sync_token_1 = "t392-516_47314_0_7_1";
         let sync_token_2 = "t392-516_47314_0_7_2";
@@ -564,6 +599,37 @@ impl StateStoreIntegrationTests for DynStateStore {
 
         self.remove_kv_data(StateStoreDataKey::SyncToken).await.unwrap();
         assert_matches!(self.get_kv_data(StateStoreDataKey::SyncToken).await, Ok(None));
+    }
+
+    async fn test_utd_hook_manager_data_saving(&self) {
+        // Before any data is written, the getter should return None.
+        assert!(
+            self.get_kv_data(StateStoreDataKey::UtdHookManagerData)
+                .await
+                .expect("Could not read data")
+                .is_none(),
+            "Store was not empty at start"
+        );
+
+        // Put some data in the store...
+        let data = GrowableBloomBuilder::new().build();
+        self.set_kv_data(
+            StateStoreDataKey::UtdHookManagerData,
+            StateStoreDataValue::UtdHookManagerData(data.clone()),
+        )
+        .await
+        .expect("Could not save data");
+
+        // ... and check it comes back.
+        let read_data = self
+            .get_kv_data(StateStoreDataKey::UtdHookManagerData)
+            .await
+            .expect("Could not read data")
+            .expect("no data found")
+            .into_utd_hook_manager_data()
+            .expect("not UtdHookManagerData");
+
+        assert_eq!(read_data, data);
     }
 
     async fn test_stripped_member_saving(&self) {
@@ -1058,6 +1124,77 @@ impl StateStoreIntegrationTests for DynStateStore {
         Ok(())
     }
 
+    async fn test_profile_removal(&self) -> Result<()> {
+        let room_id = room_id();
+
+        // Both the user id and invited user id get a profile in populate().
+        let user_id = user_id();
+        let invited_user_id = invited_user_id();
+
+        self.populate().await?;
+
+        let new_invite_member_json = json!({
+            "content": {
+                "avatar_url": "mxc://localhost/SEsfnsuifSDFSSEG",
+                "displayname": "example after update",
+                "membership": "invite",
+                "reason": "Looking for support"
+            },
+            "event_id": "$143273582443PhrSm:localhost",
+            "origin_server_ts": 1432735824,
+            "room_id": room_id,
+            "sender": user_id,
+            "state_key": invited_user_id,
+            "type": "m.room.member",
+        });
+        let new_invite_member_event: SyncRoomMemberEvent =
+            serde_json::from_value(new_invite_member_json.clone()).unwrap();
+
+        let mut changes = StateChanges {
+            // Both get their profiles deleted…
+            profiles_to_delete: [(
+                room_id.to_owned(),
+                vec![user_id.to_owned(), invited_user_id.to_owned()],
+            )]
+            .into(),
+
+            // …but the invited user get a new profile.
+            profiles: {
+                let mut map = BTreeMap::default();
+                map.insert(
+                    room_id.to_owned(),
+                    [(invited_user_id.to_owned(), new_invite_member_event.into())]
+                        .into_iter()
+                        .collect(),
+                );
+                map
+            },
+
+            ..StateChanges::default()
+        };
+
+        let raw = serde_json::from_value::<Raw<AnySyncStateEvent>>(new_invite_member_json)
+            .expect("can create sync-state-event for topic");
+        let event = raw.deserialize().unwrap();
+        changes.add_state_event(room_id, event, raw);
+
+        self.save_changes(&changes).await.unwrap();
+
+        // The profile for user has been removed.
+        assert!(self.get_profile(room_id, user_id).await?.is_none());
+        assert!(self.get_member_event(room_id, user_id).await?.is_some());
+
+        // The profile for the invited user has been updated.
+        let invited_member_event = self.get_profile(room_id, invited_user_id).await?.unwrap();
+        assert_eq!(
+            invited_member_event.as_original().unwrap().content.displayname.as_deref(),
+            Some("example after update")
+        );
+        assert!(self.get_member_event(room_id, invited_user_id).await?.is_some());
+
+        Ok(())
+    }
+
     async fn test_presence_saving(&self) {
         let user_id = user_id();
         let second_user_id = user_id!("@second:localhost");
@@ -1163,6 +1300,155 @@ impl StateStoreIntegrationTests for DynStateStore {
         let names = self.get_users_with_display_names(room_id, &[]).await;
         assert!(names.unwrap().is_empty());
     }
+
+    #[allow(clippy::needless_range_loop)]
+    async fn test_send_queue(&self) {
+        let room_id = room_id!("!test_send_queue:localhost");
+
+        // No queued event in store at first.
+        let events = self.load_send_queue_events(room_id).await.unwrap();
+        assert!(events.is_empty());
+
+        // Saving one thing should work.
+        let txn0 = TransactionId::new();
+        let event0 =
+            SerializableEventContent::new(&RoomMessageEventContent::text_plain("msg0").into())
+                .unwrap();
+        self.save_send_queue_event(room_id, txn0.clone(), event0).await.unwrap();
+
+        // Reading it will work.
+        let pending = self.load_send_queue_events(room_id).await.unwrap();
+
+        assert_eq!(pending.len(), 1);
+        {
+            assert_eq!(pending[0].transaction_id, txn0);
+
+            let deserialized = pending[0].event.deserialize().unwrap();
+            assert_let!(AnyMessageLikeEventContent::RoomMessage(content) = deserialized);
+            assert_eq!(content.body(), "msg0");
+
+            assert!(!pending[0].is_wedged);
+        }
+
+        // Saving another three things should work.
+        for i in 1..=3 {
+            let txn = TransactionId::new();
+            let event = SerializableEventContent::new(
+                &RoomMessageEventContent::text_plain(format!("msg{i}")).into(),
+            )
+            .unwrap();
+
+            self.save_send_queue_event(room_id, txn, event).await.unwrap();
+        }
+
+        // Reading all the events should work.
+        let pending = self.load_send_queue_events(room_id).await.unwrap();
+
+        // All the events should be retrieved, in the same order.
+        assert_eq!(pending.len(), 4);
+
+        assert_eq!(pending[0].transaction_id, txn0);
+
+        for i in 0..4 {
+            let deserialized = pending[i].event.deserialize().unwrap();
+            assert_let!(AnyMessageLikeEventContent::RoomMessage(content) = deserialized);
+            assert_eq!(content.body(), format!("msg{i}"));
+            assert!(!pending[i].is_wedged);
+        }
+
+        // Marking an event as wedged works.
+        let txn2 = &pending[2].transaction_id;
+        self.update_send_queue_event_status(room_id, txn2, true).await.unwrap();
+
+        // And it is reflected.
+        let pending = self.load_send_queue_events(room_id).await.unwrap();
+
+        // All the events should be retrieved, in the same order.
+        assert_eq!(pending.len(), 4);
+        assert_eq!(pending[0].transaction_id, txn0);
+        assert_eq!(pending[2].transaction_id, *txn2);
+        assert!(pending[2].is_wedged);
+        for i in 0..4 {
+            if i != 2 {
+                assert!(!pending[i].is_wedged);
+            }
+        }
+
+        // Updating an event will work, and reset its wedged state to false.
+        let event0 = SerializableEventContent::new(
+            &RoomMessageEventContent::text_plain("wow that's a cool test").into(),
+        )
+        .unwrap();
+        self.update_send_queue_event(room_id, txn2, event0).await.unwrap();
+
+        // And it is reflected.
+        let pending = self.load_send_queue_events(room_id).await.unwrap();
+
+        assert_eq!(pending.len(), 4);
+        {
+            assert_eq!(pending[2].transaction_id, *txn2);
+
+            let deserialized = pending[2].event.deserialize().unwrap();
+            assert_let!(AnyMessageLikeEventContent::RoomMessage(content) = deserialized);
+            assert_eq!(content.body(), "wow that's a cool test");
+
+            assert!(!pending[2].is_wedged);
+
+            for i in 0..4 {
+                if i != 2 {
+                    let deserialized = pending[i].event.deserialize().unwrap();
+                    assert_let!(AnyMessageLikeEventContent::RoomMessage(content) = deserialized);
+                    assert_eq!(content.body(), format!("msg{i}"));
+
+                    assert!(!pending[i].is_wedged);
+                }
+            }
+        }
+
+        // Removing an event works.
+        self.remove_send_queue_event(room_id, &txn0).await.unwrap();
+
+        // And it is reflected.
+        let pending = self.load_send_queue_events(room_id).await.unwrap();
+
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[1].transaction_id, *txn2);
+        for i in 0..3 {
+            assert_ne!(pending[i].transaction_id, txn0);
+        }
+
+        // Now add one event for two other rooms, remove one of the events, and then
+        // query all the rooms which have outstanding unsent events.
+
+        // Add one event for room2.
+        let room_id2 = room_id!("!test_send_queue_two:localhost");
+        {
+            let txn = TransactionId::new();
+            let event =
+                SerializableEventContent::new(&RoomMessageEventContent::text_plain("room2").into())
+                    .unwrap();
+            self.save_send_queue_event(room_id2, txn.clone(), event).await.unwrap();
+        }
+
+        // Add and remove one event for room3.
+        {
+            let room_id3 = room_id!("!test_send_queue_three:localhost");
+            let txn = TransactionId::new();
+            let event =
+                SerializableEventContent::new(&RoomMessageEventContent::text_plain("room3").into())
+                    .unwrap();
+            self.save_send_queue_event(room_id3, txn.clone(), event).await.unwrap();
+
+            self.remove_send_queue_event(room_id3, &txn).await.unwrap();
+        }
+
+        // Query all the rooms which have unsent events. Per the previous steps,
+        // it should be room1 and room2, not room3.
+        let outstanding_rooms = self.load_rooms_with_unsent_events().await.unwrap();
+        assert_eq!(outstanding_rooms.len(), 2);
+        assert!(outstanding_rooms.iter().any(|room| room == room_id));
+        assert!(outstanding_rooms.iter().any(|room| room == room_id2));
+    }
 }
 
 /// Macro building to allow your StateStore implementation to run the entire
@@ -1204,11 +1490,13 @@ macro_rules! statestore_integration_tests {
             }
         }
     };
+
     () => {
         mod statestore_integration_tests {
             $crate::statestore_integration_tests!(@inner);
         }
     };
+
     (@inner) => {
         use matrix_sdk_test::async_test;
 
@@ -1241,9 +1529,21 @@ macro_rules! statestore_integration_tests {
         }
 
         #[async_test]
+        async fn test_user_avatar_url_saving() {
+            let store = get_store().await.unwrap().into_state_store();
+            store.test_user_avatar_url_saving().await
+        }
+
+        #[async_test]
         async fn test_sync_token_saving() {
             let store = get_store().await.unwrap().into_state_store();
             store.test_sync_token_saving().await
+        }
+
+        #[async_test]
+        async fn test_utd_hook_manager_data_saving() {
+             let store = get_store().await.expect("creating store failed").into_state_store();
+             store.test_utd_hook_manager_data_saving().await;
         }
 
         #[async_test]
@@ -1289,6 +1589,12 @@ macro_rules! statestore_integration_tests {
         }
 
         #[async_test]
+        async fn test_profile_removal() -> StoreResult<()> {
+            let store = get_store().await?.into_state_store();
+            store.test_profile_removal().await
+        }
+
+        #[async_test]
         async fn test_presence_saving() {
             let store = get_store().await.expect("creating store failed").into_state_store();
             store.test_presence_saving().await;
@@ -1298,6 +1604,12 @@ macro_rules! statestore_integration_tests {
         async fn test_display_names_saving() {
             let store = get_store().await.expect("creating store failed").into_state_store();
             store.test_display_names_saving().await;
+        }
+
+        #[async_test]
+        async fn test_send_queue() {
+            let store = get_store().await.expect("creating store failed").into_state_store();
+            store.test_send_queue().await;
         }
     };
 }

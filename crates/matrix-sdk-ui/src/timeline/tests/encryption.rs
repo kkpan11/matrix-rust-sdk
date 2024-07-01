@@ -23,16 +23,25 @@ use std::{
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use matrix_sdk::crypto::{decrypt_room_key_export, OlmMachine};
+use matrix_sdk::{
+    crypto::{decrypt_room_key_export, types::events::UtdCause, OlmMachine},
+    test_utils::test_client_builder,
+};
 use matrix_sdk_test::{async_test, BOB};
 use ruma::{
     assign,
-    events::room::encrypted::{
-        EncryptedEventScheme, MegolmV1AesSha2ContentInit, Relation, Replacement,
-        RoomEncryptedEventContent,
+    events::{
+        room::encrypted::{
+            EncryptedEventScheme, MegolmV1AesSha2ContentInit, Relation, Replacement,
+            RoomEncryptedEventContent,
+        },
+        AnySyncTimelineEvent,
     },
-    room_id, user_id,
+    room_id,
+    serde::Raw,
+    user_id,
 };
+use serde_json::{json, value::to_raw_value};
 use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
@@ -70,7 +79,8 @@ async fn test_retry_message_decryption() {
     }
 
     let hook = Arc::new(DummyUtdHook::default());
-    let utd_hook = Arc::new(UtdHookManager::new(hook.clone()));
+    let client = test_client_builder(None).build().await.unwrap();
+    let utd_hook = Arc::new(UtdHookManager::new(hook.clone(), client));
 
     let timeline = TestTimeline::with_unable_to_decrypt_hook(utd_hook.clone());
     let mut stream = timeline.subscribe().await;
@@ -102,7 +112,6 @@ async fn test_retry_message_decryption() {
 
     assert_eq!(timeline.inner.items().await.len(), 2);
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event = item.as_event().unwrap();
     assert_let!(
@@ -112,6 +121,10 @@ async fn test_retry_message_decryption() {
         }) = event.content()
     );
     assert_eq!(session_id, SESSION_ID);
+
+    assert_next_matches!(stream, VectorDiff::PushFront { value } => {
+        assert!(value.is_day_divider());
+    });
 
     {
         let utds = hook.utds.lock().unwrap();
@@ -144,17 +157,14 @@ async fn test_retry_message_decryption() {
     assert_eq!(message.body(), "It's a secret to everybody");
     assert!(!event.is_highlighted());
 
+    // The message should not be re-reported as a late decryption.
     {
         let utds = hook.utds.lock().unwrap();
-        assert_eq!(utds.len(), 2);
+        assert_eq!(utds.len(), 1);
 
         // The previous UTD report is still there.
         assert_eq!(utds[0].event_id, event.event_id().unwrap());
         assert!(utds[0].time_to_decrypt.is_none());
-
-        // The UTD is now *also* reported as a late-decryption event.
-        assert_eq!(utds[1].event_id, event.event_id().unwrap());
-        assert!(utds[1].time_to_decrypt.is_some());
     }
 }
 
@@ -415,7 +425,6 @@ async fn test_retry_message_decryption_highlighted() {
 
     assert_eq!(timeline.inner.items().await.len(), 2);
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event = item.as_event().unwrap();
     assert_let!(
@@ -425,6 +434,9 @@ async fn test_retry_message_decryption_highlighted() {
         }) = event.content()
     );
     assert_eq!(session_id, SESSION_ID);
+
+    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
 
     let own_user_id = user_id!("@example:matrix.org");
     let exported_keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "1234").unwrap();
@@ -449,4 +461,105 @@ async fn test_retry_message_decryption_highlighted() {
     assert_let!(TimelineItemContent::Message(message) = event.content());
     assert_eq!(message.body(), "A secret to everybody but Alice");
     assert!(event.is_highlighted());
+}
+
+#[async_test]
+async fn test_utd_cause_for_nonmember_event_is_found() {
+    // Given a timline
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe().await;
+
+    // When we add an event with "membership: leave"
+    timeline.handle_live_event(raw_event_with_unsigned(json!({ "membership": "leave" }))).await;
+
+    // Then its UTD cause is membership
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let event = item.as_event().unwrap();
+    assert_let!(
+        TimelineItemContent::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 { cause, .. }) =
+            event.content()
+    );
+    assert_eq!(*cause, UtdCause::Membership);
+}
+
+#[async_test]
+async fn test_utd_cause_for_nonmember_event_is_found_unstable_prefix() {
+    // Given a timline
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe().await;
+
+    // When we add an event with "io.element.msc4115.membership: leave"
+    timeline
+        .handle_live_event(raw_event_with_unsigned(
+            json!({ "io.element.msc4115.membership": "leave" }),
+        ))
+        .await;
+
+    // Then its UTD cause is membership
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let event = item.as_event().unwrap();
+    assert_let!(
+        TimelineItemContent::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 { cause, .. }) =
+            event.content()
+    );
+    assert_eq!(*cause, UtdCause::Membership);
+}
+
+#[async_test]
+async fn test_utd_cause_for_member_event_is_unknown() {
+    // Given a timline
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe().await;
+
+    // When we add an event with "membership: join"
+    timeline.handle_live_event(raw_event_with_unsigned(json!({ "membership": "join" }))).await;
+
+    // Then its UTD cause is membership
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let event = item.as_event().unwrap();
+    assert_let!(
+        TimelineItemContent::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 { cause, .. }) =
+            event.content()
+    );
+    assert_eq!(*cause, UtdCause::Unknown);
+}
+
+#[async_test]
+async fn test_utd_cause_for_missing_membership_is_unknown() {
+    // Given a timline
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe().await;
+
+    // When we add an event with no membership in unsigned
+    timeline.handle_live_event(raw_event_with_unsigned(json!({}))).await;
+
+    // Then its UTD cause is membership
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let event = item.as_event().unwrap();
+    assert_let!(
+        TimelineItemContent::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 { cause, .. }) =
+            event.content()
+    );
+    assert_eq!(*cause, UtdCause::Unknown);
+}
+
+fn raw_event_with_unsigned(unsigned: serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+    Raw::from_json(
+        to_raw_value(&json!({
+            "event_id": "$myevent",
+            "sender": "@u:s",
+            "origin_server_ts": 3,
+            "type": "m.room.encrypted",
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": "NOT_REAL_CIPHERTEXT",
+                "sender_key": "SENDER_KEY",
+                "device_id": "DEVICE_ID",
+                "session_id":  "SESSION_ID",
+            },
+            "unsigned": unsigned
+
+        }))
+        .unwrap(),
+    )
 }

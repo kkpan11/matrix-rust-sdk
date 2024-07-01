@@ -19,18 +19,21 @@
 use std::io::Read;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
-use std::{fmt, fs::File, io, path::Path};
+use std::{fmt, fs::File, path::Path};
 
 use eyeball::SharedObservable;
 use futures_util::future::try_join;
 pub use matrix_sdk_base::media::*;
 use mime::Mime;
 use ruma::{
-    api::client::media::{create_content, get_content, get_content_thumbnail},
+    api::{
+        client::{authenticated_media, media},
+        MatrixVersion,
+    },
     assign,
     events::room::{
         message::{
-            self, AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
+            AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
             ImageMessageEventContent, MessageType, UnstableAudioDetailsContentBlock,
             UnstableVoiceContentBlock, VideoInfo, VideoMessageEventContent,
         },
@@ -94,7 +97,7 @@ impl MediaFileHandle {
 #[cfg(not(target_arch = "wasm32"))]
 pub struct PersistError {
     /// The underlying IO error.
-    pub error: io::Error,
+    pub error: std::io::Error,
     /// The temporary file that couldn't be persisted.
     pub file: MediaFileHandle,
 }
@@ -114,7 +117,7 @@ impl fmt::Display for PersistError {
 }
 
 /// `IntoFuture` returned by [`Media::upload`].
-pub type SendUploadRequest = SendRequest<create_content::v3::Request>;
+pub type SendUploadRequest = SendRequest<media::create_content::v3::Request>;
 
 impl Media {
     pub(crate) fn new(client: Client) -> Self {
@@ -126,10 +129,10 @@ impl Media {
     /// # Arguments
     ///
     /// * `content_type` - The type of the media, this will be used as the
-    /// content-type header.
+    ///   content-type header.
     ///
     /// * `reader` - A `Reader` that will be used to fetch the raw bytes of the
-    /// media.
+    ///   media.
     ///
     /// # Examples
     ///
@@ -154,7 +157,7 @@ impl Media {
             MIN_UPLOAD_REQUEST_TIMEOUT,
         );
 
-        let request = assign!(create_content::v3::Request::new(data), {
+        let request = assign!(media::create_content::v3::Request::new(data), {
             content_type: Some(content_type.essence_str().to_owned()),
         });
 
@@ -269,10 +272,22 @@ impl Media {
             }
         };
 
+        // Use the authenticated endpoints when the server supports Matrix 1.11.
+        // TODO: Add an option in ClientBuilder to force the use of the authenticated
+        // endpoints.
+        let use_auth = self.client.server_versions().await?.contains(&MatrixVersion::V1_11);
+
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {
-                let request = get_content::v3::Request::from_url(&file.url)?;
-                let content: Vec<u8> = self.client.send(request, None).await?.file;
+                let content = if use_auth {
+                    let request =
+                        authenticated_media::get_content::v1::Request::from_uri(&file.url)?;
+                    self.client.send(request, None).await?.file
+                } else {
+                    #[allow(deprecated)]
+                    let request = media::get_content::v3::Request::from_url(&file.url)?;
+                    self.client.send(request, None).await?.file
+                };
 
                 #[cfg(feature = "e2e-encryption")]
                 let content = {
@@ -296,11 +311,29 @@ impl Media {
             }
             MediaSource::Plain(uri) => {
                 if let MediaFormat::Thumbnail(size) = &request.format {
-                    let request =
-                        get_content_thumbnail::v3::Request::from_url(uri, size.width, size.height)?;
+                    if use_auth {
+                        let request =
+                            authenticated_media::get_content_thumbnail::v1::Request::from_uri(
+                                uri,
+                                size.width,
+                                size.height,
+                            )?;
+                        self.client.send(request, None).await?.file
+                    } else {
+                        #[allow(deprecated)]
+                        let request = media::get_content_thumbnail::v3::Request::from_url(
+                            uri,
+                            size.width,
+                            size.height,
+                        )?;
+                        self.client.send(request, None).await?.file
+                    }
+                } else if use_auth {
+                    let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
                     self.client.send(request, None).await?.file
                 } else {
-                    let request = get_content::v3::Request::from_url(uri)?;
+                    #[allow(deprecated)]
+                    let request = media::get_content::v3::Request::from_url(uri)?;
                     self.client.send(request, None).await?.file
                 }
             }
@@ -475,18 +508,17 @@ impl Media {
                     thumbnail_source,
                     thumbnail_info,
                 });
-                MessageType::Image(
-                    ImageMessageEventContent::plain(body.to_owned(), url)
-                        .info(Box::new(info))
-                        .filename(filename)
-                        .formatted(config.formatted_caption),
-                )
+                let mut image_message_event_content =
+                    ImageMessageEventContent::plain(body.to_owned(), url).info(Box::new(info));
+                image_message_event_content.filename = filename;
+                image_message_event_content.formatted = config.formatted_caption;
+                MessageType::Image(image_message_event_content)
             }
             mime::AUDIO => {
-                let audio_message_event_content =
-                    message::AudioMessageEventContent::plain(body.to_owned(), url)
-                        .filename(filename)
-                        .formatted(config.formatted_caption);
+                let mut audio_message_event_content =
+                    AudioMessageEventContent::plain(body.to_owned(), url);
+                audio_message_event_content.filename = filename;
+                audio_message_event_content.formatted = config.formatted_caption;
                 MessageType::Audio(update_audio_message_event(
                     audio_message_event_content,
                     content_type,
@@ -499,12 +531,11 @@ impl Media {
                     thumbnail_source,
                     thumbnail_info
                 });
-                MessageType::Video(
-                    VideoMessageEventContent::plain(body.to_owned(), url)
-                        .info(Box::new(info))
-                        .filename(filename)
-                        .formatted(config.formatted_caption),
-                )
+                let mut video_message_event_content =
+                    VideoMessageEventContent::plain(body.to_owned(), url).info(Box::new(info));
+                video_message_event_content.filename = filename;
+                video_message_event_content.formatted = config.formatted_caption;
+                MessageType::Video(video_message_event_content)
             }
             _ => {
                 let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
@@ -512,12 +543,11 @@ impl Media {
                     thumbnail_source,
                     thumbnail_info
                 });
-                MessageType::File(
-                    FileMessageEventContent::plain(body.to_owned(), url)
-                        .info(Box::new(info))
-                        .filename(filename)
-                        .formatted(config.formatted_caption),
-                )
+                let mut file_message_event_content =
+                    FileMessageEventContent::plain(body.to_owned(), url).info(Box::new(info));
+                file_message_event_content.filename = filename;
+                file_message_event_content.formatted = config.formatted_caption;
+                MessageType::File(file_message_event_content)
             }
         })
     }

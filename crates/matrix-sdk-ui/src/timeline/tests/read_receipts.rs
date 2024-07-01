@@ -48,12 +48,12 @@ async fn test_read_receipts_updates_on_live_events() {
     timeline.handle_live_message_event(*ALICE, RoomMessageEventContent::text_plain("A")).await;
     timeline.handle_live_message_event(*BOB, RoomMessageEventContent::text_plain("B")).await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     // No read receipt for our own user.
     let item_a = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event_a = item_a.as_event().unwrap();
     assert!(event_a.read_receipts().is_empty());
+
+    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
     // Implicit read receipt of Bob.
     let item_b = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -149,12 +149,12 @@ async fn test_read_receipts_updates_on_filtered_events() {
     timeline.handle_live_message_event(*ALICE, RoomMessageEventContent::text_plain("A")).await;
     timeline.handle_live_message_event(*BOB, RoomMessageEventContent::notice_plain("B")).await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     // No read receipt for our own user.
     let item_a = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event_a = item_a.as_event().unwrap();
     assert!(event_a.read_receipts().is_empty());
+
+    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
     // Implicit read receipt of Bob.
     let item_a = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
@@ -240,12 +240,12 @@ async fn test_read_receipts_updates_on_filtered_events_with_stored() {
         )
         .await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     // No read receipt for our own user.
     let item_a = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event_a = item_a.as_event().unwrap();
     assert!(event_a.read_receipts().is_empty());
+
+    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
     // Stored read receipt of Bob.
     let item_a = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
@@ -302,12 +302,13 @@ async fn test_read_receipts_updates_on_back_paginated_filtered_events() {
         )
         .await;
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-
     // No read receipt for our own user.
-    let item_a = assert_next_matches!(stream, VectorDiff::Insert { index: 1, value } => value);
+    let item_a = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     let event_a = item_a.as_event().unwrap();
     assert!(event_a.read_receipts().is_empty());
+
+    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
 
     // Add non-filtered event to show read receipts.
     timeline
@@ -320,11 +321,18 @@ async fn test_read_receipts_updates_on_back_paginated_filtered_events() {
         .await;
 
     // Implicit read receipt of Carol.
-    let item_c = assert_next_matches!(stream, VectorDiff::Insert { index: 1, value } => value);
+    let item_c = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     let event_c = item_c.as_event().unwrap();
     assert_eq!(event_c.read_receipts().len(), 2);
     assert!(event_c.read_receipts().get(*BOB).is_some());
     assert!(event_c.read_receipts().get(*CAROL).is_some());
+
+    // Reinsert a new day divider before the first back-paginated event.
+    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
+
+    // Remove the last day divider.
+    assert_next_matches!(stream, VectorDiff::Remove { index: 2 });
 
     assert_pending!(stream);
 }
@@ -411,14 +419,14 @@ async fn test_read_receipts_updates_on_message_decryption() {
 
     assert_eq!(timeline.inner.items().await.len(), 3);
 
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-
     // The first event only has Carol's receipt.
     let clear_item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let clear_event = clear_item.as_event().unwrap();
     assert_matches!(clear_event.content(), TimelineItemContent::Message(_));
     assert_eq!(clear_event.read_receipts().len(), 1);
     assert!(clear_event.read_receipts().get(*CAROL).is_some());
+
+    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
     // The second event is encrypted and only has Bob's receipt.
     let encrypted_item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -482,7 +490,7 @@ async fn test_initial_public_unthreaded_receipt() {
         );
 
     let timeline = TestTimeline::with_room_data_provider(
-        TestRoomDataProvider::with_initial_user_receipts(initial_user_receipts),
+        TestRoomDataProvider::default().with_initial_user_receipts(initial_user_receipts),
     )
     .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
 
@@ -507,7 +515,7 @@ async fn test_initial_public_main_thread_receipt() {
         );
 
     let timeline = TestTimeline::with_room_data_provider(
-        TestRoomDataProvider::with_initial_user_receipts(initial_user_receipts),
+        TestRoomDataProvider::default().with_initial_user_receipts(initial_user_receipts),
     )
     .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
 
@@ -532,7 +540,7 @@ async fn test_initial_private_unthreaded_receipt() {
         );
 
     let timeline = TestTimeline::with_room_data_provider(
-        TestRoomDataProvider::with_initial_user_receipts(initial_user_receipts),
+        TestRoomDataProvider::default().with_initial_user_receipts(initial_user_receipts),
     )
     .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
 
@@ -557,7 +565,7 @@ async fn test_initial_private_main_thread_receipt() {
         );
 
     let timeline = TestTimeline::with_room_data_provider(
-        TestRoomDataProvider::with_initial_user_receipts(initial_user_receipts),
+        TestRoomDataProvider::default().with_initial_user_receipts(initial_user_receipts),
     )
     .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
 

@@ -544,7 +544,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
     }
 
     match event {
-        ruma::events::AnySyncTimelineEvent::MessageLike(event) => {
+        AnySyncTimelineEvent::MessageLike(event) => {
             // Filter out redactions.
             let Some(content) = event.original_content() else {
                 tracing::trace!("not interesting because redacted");
@@ -563,6 +563,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
             match event {
                 AnySyncMessageLikeEvent::CallAnswer(_)
                 | AnySyncMessageLikeEvent::CallInvite(_)
+                | AnySyncMessageLikeEvent::CallNotify(_)
                 | AnySyncMessageLikeEvent::CallHangup(_)
                 | AnySyncMessageLikeEvent::CallCandidates(_)
                 | AnySyncMessageLikeEvent::CallNegotiate(_)
@@ -612,7 +613,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
             }
         }
 
-        ruma::events::AnySyncTimelineEvent::State(_) => false,
+        AnySyncTimelineEvent::State(_) => false,
     }
 }
 
@@ -761,17 +762,16 @@ mod tests {
     #[test]
     fn test_count_unread_and_mentions() {
         fn make_event(user_id: &UserId, push_actions: Vec<Action>) -> SyncTimelineEvent {
-            SyncTimelineEvent {
-                event: sync_timeline_event!({
+            SyncTimelineEvent::new_with_push_actions(
+                sync_timeline_event!({
                     "sender": user_id,
                     "type": "m.room.message",
                     "event_id": "$ida",
                     "origin_server_ts": 12344446,
                     "content": { "body":"A", "msgtype": "m.text" },
                 }),
-                encryption_info: None,
                 push_actions,
-            }
+            )
         }
 
         let user_id = user_id!("@alice:example.org");
@@ -846,17 +846,13 @@ mod tests {
         // When provided with one event, that's not the receipt event, we don't count
         // it.
         fn make_event(event_id: &EventId) -> SyncTimelineEvent {
-            SyncTimelineEvent {
-                event: sync_timeline_event!({
-                    "sender": "@bob:example.org",
-                    "type": "m.room.message",
-                    "event_id": event_id,
-                    "origin_server_ts": 12344446,
-                    "content": { "body":"A", "msgtype": "m.text" },
-                }),
-                encryption_info: None,
-                push_actions: Vec::new(),
-            }
+            SyncTimelineEvent::new(sync_timeline_event!({
+                "sender": "@bob:example.org",
+                "type": "m.room.message",
+                "event_id": event_id,
+                "origin_server_ts": 12344446,
+                "content": { "body":"A", "msgtype": "m.text" },
+            }))
         }
 
         let mut receipts = RoomReadReceipts {

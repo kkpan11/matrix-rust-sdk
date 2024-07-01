@@ -65,6 +65,22 @@ pub trait CryptoStore: AsyncTraitDeps {
     /// * `changes` - The set of changes that should be stored.
     async fn save_pending_changes(&self, changes: PendingChanges) -> Result<(), Self::Error>;
 
+    /// Save a list of inbound group sessions to the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `sessions` - The sessions to be saved.
+    /// * `backed_up_to_version` - If the keys should be marked as having been
+    ///   backed up, the version of the backup.
+    ///
+    /// Note: some implementations ignore `backup_version` and assume the
+    /// current backup version, which is normally the same.
+    async fn save_inbound_group_sessions(
+        &self,
+        sessions: Vec<InboundGroupSession>,
+        backed_up_to_version: Option<&str>,
+    ) -> Result<(), Self::Error>;
+
     /// Get all the sessions that belong to the given sender key.
     ///
     /// # Arguments
@@ -105,22 +121,43 @@ pub trait CryptoStore: AsyncTraitDeps {
 
     /// Get the number inbound group sessions we have and how many of them are
     /// backed up.
-    async fn inbound_group_session_counts(&self) -> Result<RoomKeyCounts, Self::Error>;
+    async fn inbound_group_session_counts(
+        &self,
+        backup_version: Option<&str>,
+    ) -> Result<RoomKeyCounts, Self::Error>;
 
-    /// Get all the inbound group sessions we have not backed up yet.
+    /// Return a batch of ['InboundGroupSession'] ("room keys") that have not
+    /// yet been backed up in the supplied backup version.
+    ///
+    /// The size of the returned `Vec` is <= `limit`.
+    ///
+    /// Note: some implementations ignore `backup_version` and assume the
+    /// current backup version, which is normally the same.
     async fn inbound_group_sessions_for_backup(
         &self,
+        backup_version: &str,
         limit: usize,
     ) -> Result<Vec<InboundGroupSession>, Self::Error>;
 
-    /// Mark the inbound group sessions with the supplied room and session IDs
-    /// as backed up
+    /// Store the fact that the supplied sessions were backed up into the backup
+    /// with version `backup_version`.
+    ///
+    /// Note: some implementations ignore `backup_version` and assume the
+    /// current backup version, which is normally the same.
     async fn mark_inbound_group_sessions_as_backed_up(
         &self,
+        backup_version: &str,
         room_and_session_ids: &[(&RoomId, &str)],
     ) -> Result<(), Self::Error>;
 
     /// Reset the backup state of all the stored inbound group sessions.
+    ///
+    /// Note: this is mostly implemented by stores that ignore the
+    /// `backup_version` argument on `inbound_group_sessions_for_backup` and
+    /// `mark_inbound_group_sessions_as_backed_up`. Implementations that
+    /// pay attention to the supplied backup version probably don't need to
+    /// update their storage when the current backup version changes, so have
+    /// empty implementations of this method.
     async fn reset_backup_state(&self) -> Result<(), Self::Error>;
 
     /// Get the backup keys we have stored.
@@ -133,11 +170,14 @@ pub trait CryptoStore: AsyncTraitDeps {
         room_id: &RoomId,
     ) -> Result<Option<OutboundGroupSession>, Self::Error>;
 
-    /// Load the list of users whose devices we are keeping track of.
+    /// Provide the list of users whose devices we are keeping track of, and
+    /// whether they are considered dirty/outdated.
     async fn load_tracked_users(&self) -> Result<Vec<TrackedUser>, Self::Error>;
 
-    /// Save a list of users and their respective dirty/outdated flags to the
-    /// store.
+    /// Update the list of users whose devices we are keeping track of, and
+    /// whether they are considered dirty/outdated.
+    ///
+    /// Replaces any existing entry with a matching user ID.
     async fn save_tracked_users(&self, users: &[(&UserId, bool)]) -> Result<(), Self::Error>;
 
     /// Get the device for the given user with the given device ID.
@@ -162,6 +202,12 @@ pub trait CryptoStore: AsyncTraitDeps {
         &self,
         user_id: &UserId,
     ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>, Self::Error>;
+
+    /// Get the device for the current client.
+    ///
+    /// Since our own device is set when the store is created, this will always
+    /// return a device (unless there is an error).
+    async fn get_own_device(&self) -> Result<ReadOnlyDevice, Self::Error>;
 
     /// Get the user identity that is attached to the given user id.
     ///
@@ -279,6 +325,13 @@ pub trait CryptoStore: AsyncTraitDeps {
 
     /// Load the next-batch token for a to-device query, if any.
     async fn next_batch_token(&self) -> Result<Option<String>, Self::Error>;
+
+    /// Clear any in-memory caches because they may be out of sync with the
+    /// underlying data store.
+    ///
+    /// If the store does not have any underlying persistence (e.g in-memory
+    /// store) then this should be a no-op.
+    async fn clear_caches(&self);
 }
 
 #[repr(transparent)]
@@ -296,6 +349,10 @@ impl<T: fmt::Debug> fmt::Debug for EraseCryptoStoreError<T> {
 impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
     type Error = CryptoStoreError;
 
+    async fn clear_caches(&self) {
+        self.0.clear_caches().await
+    }
+
     async fn load_account(&self) -> Result<Option<Account>> {
         self.0.load_account().await.map_err(Into::into)
     }
@@ -310,6 +367,14 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
 
     async fn save_pending_changes(&self, changes: PendingChanges) -> Result<()> {
         self.0.save_pending_changes(changes).await.map_err(Into::into)
+    }
+
+    async fn save_inbound_group_sessions(
+        &self,
+        sessions: Vec<InboundGroupSession>,
+        backed_up_to_version: Option<&str>,
+    ) -> Result<()> {
+        self.0.save_inbound_group_sessions(sessions, backed_up_to_version).await.map_err(Into::into)
     }
 
     async fn get_sessions(&self, sender_key: &str) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
@@ -328,23 +393,27 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         self.0.get_inbound_group_sessions().await.map_err(Into::into)
     }
 
-    async fn inbound_group_session_counts(&self) -> Result<RoomKeyCounts> {
-        self.0.inbound_group_session_counts().await.map_err(Into::into)
+    async fn inbound_group_session_counts(
+        &self,
+        backup_version: Option<&str>,
+    ) -> Result<RoomKeyCounts> {
+        self.0.inbound_group_session_counts(backup_version).await.map_err(Into::into)
     }
-
     async fn inbound_group_sessions_for_backup(
         &self,
+        backup_version: &str,
         limit: usize,
     ) -> Result<Vec<InboundGroupSession>> {
-        self.0.inbound_group_sessions_for_backup(limit).await.map_err(Into::into)
+        self.0.inbound_group_sessions_for_backup(backup_version, limit).await.map_err(Into::into)
     }
 
     async fn mark_inbound_group_sessions_as_backed_up(
         &self,
+        backup_version: &str,
         room_and_session_ids: &[(&RoomId, &str)],
     ) -> Result<()> {
         self.0
-            .mark_inbound_group_sessions_as_backed_up(room_and_session_ids)
+            .mark_inbound_group_sessions_as_backed_up(backup_version, room_and_session_ids)
             .await
             .map_err(Into::into)
     }
@@ -385,6 +454,10 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         user_id: &UserId,
     ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
         self.0.get_user_devices(user_id).await.map_err(Into::into)
+    }
+
+    async fn get_own_device(&self) -> Result<ReadOnlyDevice> {
+        self.0.get_own_device().await.map_err(Into::into)
     }
 
     async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<ReadOnlyUserIdentities>> {

@@ -33,7 +33,7 @@ pub mod types;
 mod utilities;
 mod verification;
 
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 /// Testing facilities and helpers for crypto tests
 pub mod testing {
     pub use crate::identities::{
@@ -90,6 +90,7 @@ pub use requests::{
     IncomingResponse, KeysBackupRequest, KeysQueryRequest, OutgoingRequest, OutgoingRequests,
     OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest, UploadSigningKeysRequest,
 };
+pub use session_manager::CollectStrategy;
 pub use store::{
     CrossSigningKeyExport, CryptoStoreError, SecretImportError, SecretInfo, TrackedUser,
 };

@@ -145,7 +145,7 @@ impl BackupMachine {
     }
 
     /// Check if our own device has signed the given signed JSON payload.
-    async fn check_own_device_signature(
+    fn check_own_device_signature(
         &self,
         signatures: &Signatures,
         auth_data: &str,
@@ -153,7 +153,7 @@ impl BackupMachine {
         match self.store.static_account().has_signed_raw(signatures, auth_data) {
             Ok(_) => SignatureState::ValidAndTrusted,
             Err(e) => match e {
-                crate::SignatureError::NoSignatureFound => SignatureState::Missing,
+                SignatureError::NoSignatureFound => SignatureState::Missing,
                 _ => SignatureState::Invalid,
             },
         }
@@ -179,7 +179,7 @@ impl BackupMachine {
                     }
                 }
                 Err(e) => match e {
-                    crate::SignatureError::NoSignatureFound => SignatureState::Missing,
+                    SignatureError::NoSignatureFound => SignatureState::Missing,
                     _ => SignatureState::Invalid,
                 },
             }
@@ -285,7 +285,7 @@ impl BackupMachine {
 
         // Check if there's a signature from our own device.
         let device_signature =
-            self.check_own_device_signature(&auth_data.signatures, &serialized_auth_data).await;
+            self.check_own_device_signature(&auth_data.signatures, &serialized_auth_data);
         // Check if there's a signature from our own user identity.
         let user_identity_signature =
             self.check_own_identity_signature(&auth_data.signatures, &serialized_auth_data).await?;
@@ -312,8 +312,8 @@ impl BackupMachine {
     ///
     /// # Arguments
     ///
-    /// * `backup_info`: The backup info that should be verified. Should
-    /// be fetched from the server using the [`/room_keys/version`] endpoint.
+    /// * `backup_info`: The backup info that should be verified. Should be
+    ///   fetched from the server using the [`/room_keys/version`] endpoint.
     ///
     /// * `compute_all_signatures`: *Useful for debugging only*. If this
     ///   parameter is `true`, the internal machinery will compute the trust
@@ -341,9 +341,9 @@ impl BackupMachine {
     ///
     /// # Arguments
     ///
-    /// * `backup_info`: The backup version that should be verified. Should
-    /// be created from the [`BackupDecryptionKey`] using the
-    /// [`BackupDecryptionKey::to_backup_info()`] method.
+    /// * `backup_info`: The backup version that should be verified. Should be
+    ///   created from the [`BackupDecryptionKey`] using the
+    ///   [`BackupDecryptionKey::to_backup_info()`] method.
     pub async fn sign_backup(
         &self,
         backup_info: &mut RoomKeyBackupInfo,
@@ -397,7 +397,8 @@ impl BackupMachine {
 
     /// Get the number of backed up room keys and the total number of room keys.
     pub async fn room_key_counts(&self) -> Result<RoomKeyCounts, CryptoStoreError> {
-        self.store.inbound_group_session_counts().await
+        let backup_version = self.backup_key.read().await.as_ref().and_then(|k| k.backup_version());
+        self.store.inbound_group_session_counts(backup_version.as_deref()).await
     }
 
     /// Disable and reset our backup state.
@@ -416,6 +417,13 @@ impl BackupMachine {
         debug!("Done disabling backup");
 
         Ok(())
+    }
+
+    /// Provide the `backup_version` of the current `backup_key`, or None if
+    /// there is no current key, or the key is not used with any backup
+    /// version.
+    pub async fn backup_version(&self) -> Option<String> {
+        self.backup_key.read().await.as_ref().and_then(|k| k.backup_version())
     }
 
     /// Store the backup decryption key in the crypto store.
@@ -476,7 +484,12 @@ impl BackupMachine {
 
                 trace!(request_id = ?r.request_id, keys = ?r.sessions, "Marking room keys as backed up");
 
-                self.store.mark_inbound_group_sessions_as_backed_up(&room_and_session_ids).await?;
+                self.store
+                    .mark_inbound_group_sessions_as_backed_up(
+                        &r.request.version,
+                        &room_and_session_ids,
+                    )
+                    .await?;
 
                 trace!(
                     request_id = ?r.request_id,
@@ -514,7 +527,7 @@ impl BackupMachine {
         };
 
         let sessions =
-            self.store.inbound_group_sessions_for_backup(Self::BACKUP_BATCH_SIZE).await?;
+            self.store.inbound_group_sessions_for_backup(&version, Self::BACKUP_BATCH_SIZE).await?;
 
         if sessions.is_empty() {
             trace!(?backup_key, "No room keys need to be backed up");
@@ -582,11 +595,12 @@ impl BackupMachine {
     /// # Arguments
     ///
     /// * `room_keys` - A list of previously exported keys that should be
-    /// imported into our store. If we already have a better version of a key
-    /// the key will *not* be imported.
+    ///   imported into our store. If we already have a better version of a key
+    ///   the key will *not* be imported.
     ///
     /// Returns a [`RoomKeyImportResult`] containing information about room keys
     /// which were imported.
+    #[deprecated(note = "Use the OlmMachine::store::import_room_keys method instead")]
     pub async fn import_backed_up_room_keys(
         &self,
         room_keys: BTreeMap<OwnedRoomId, BTreeMap<String, BackedUpRoomKey>>,
@@ -606,7 +620,15 @@ impl BackupMachine {
             }
         }
 
-        self.store.import_room_keys(decrypted_room_keys, true, progress_listener).await
+        // FIXME: This method is a bit flawed: we have no real idea which backup version
+        //   these keys came from. For example, we might have reset the backup
+        //   since the keys were downloaded. For now, let's assume they came from
+        //   the "current" backup version.
+        let backup_version = self.backup_version().await;
+
+        self.store
+            .import_room_keys(decrypted_room_keys, backup_version.as_deref(), progress_listener)
+            .await
     }
 }
 
@@ -619,9 +641,12 @@ mod tests {
     use ruma::{device_id, room_id, user_id, CanonicalJsonValue, DeviceId, RoomId, UserId};
     use serde_json::json;
 
+    use super::BackupMachine;
     use crate::{
-        olm::BackedUpRoomKey, store::BackupDecryptionKey, types::RoomKeyBackupInfo, OlmError,
-        OlmMachine,
+        olm::BackedUpRoomKey,
+        store::{BackupDecryptionKey, Changes, CryptoStore, MemoryStore},
+        types::RoomKeyBackupInfo,
+        OlmError, OlmMachine,
     };
 
     fn room_key() -> BackedUpRoomKey {
@@ -658,7 +683,10 @@ mod tests {
 
     async fn backup_flow(machine: OlmMachine) -> Result<(), OlmError> {
         let backup_machine = machine.backup_machine();
-        let counts = backup_machine.store.inbound_group_session_counts().await?;
+        let backup_version = current_backup_version(backup_machine).await;
+
+        let counts =
+            backup_machine.store.inbound_group_session_counts(backup_version.as_deref()).await?;
 
         assert_eq!(counts.total, 0, "Initially no keys exist");
         assert_eq!(counts.backed_up, 0, "Initially no backed up keys exist");
@@ -666,7 +694,8 @@ mod tests {
         machine.create_outbound_group_session_with_defaults_test_helper(room_id()).await?;
         machine.create_outbound_group_session_with_defaults_test_helper(room_id2()).await?;
 
-        let counts = backup_machine.store.inbound_group_session_counts().await?;
+        let counts =
+            backup_machine.store.inbound_group_session_counts(backup_version.as_deref()).await?;
         assert_eq!(counts.total, 2, "Two room keys need to exist in the store");
         assert_eq!(counts.backed_up, 0, "No room keys have been backed up yet");
 
@@ -685,8 +714,10 @@ mod tests {
         );
 
         backup_machine.mark_request_as_sent(&request_id).await?;
+        let backup_version = current_backup_version(backup_machine).await;
 
-        let counts = backup_machine.store.inbound_group_session_counts().await?;
+        let counts =
+            backup_machine.store.inbound_group_session_counts(backup_version.as_deref()).await?;
         assert_eq!(counts.total, 2);
         assert_eq!(counts.backed_up, 2, "All room keys have been backed up");
 
@@ -696,8 +727,10 @@ mod tests {
         );
 
         backup_machine.disable_backup().await?;
+        let backup_version = current_backup_version(backup_machine).await;
 
-        let counts = backup_machine.store.inbound_group_session_counts().await?;
+        let counts =
+            backup_machine.store.inbound_group_session_counts(backup_version.as_deref()).await?;
         assert_eq!(counts.total, 2);
         assert_eq!(
             counts.backed_up, 0,
@@ -705,6 +738,10 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    async fn current_backup_version(backup_machine: &BackupMachine) -> Option<String> {
+        backup_machine.backup_key.read().await.as_ref().and_then(|k| k.backup_version())
     }
 
     #[async_test]
@@ -798,6 +835,12 @@ mod tests {
         let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
         let backup_machine = machine.backup_machine();
 
+        // We set up a backup key, so that we can test `backup_machine.backup()` later.
+        let decryption_key = BackupDecryptionKey::new().expect("Couldn't create new recovery key");
+        let backup_key = decryption_key.megolm_v1_public_key();
+        backup_key.set_version("1".to_owned());
+        backup_machine.enable_backup_v1(backup_key).await.expect("Couldn't enable backup");
+
         let room_id = room_id!("!DovneieKSTkdHKpIXy:morpheus.localhost");
         let session_id = "gM8i47Xhu0q52xLfgUXzanCMpLinoyVyH7R58cBuVBU";
         let room_key = room_key();
@@ -811,19 +854,29 @@ mod tests {
 
         assert!(session.is_none(), "Initially we should not have the session in the store");
 
+        #[allow(deprecated)]
         backup_machine
             .import_backed_up_room_keys(room_keys, |_, _| {})
             .await
             .expect("We should be able to import a room key");
 
+        // Now check that the session was correctly imported, and that it is marked as
+        // backed up
         let session = machine.store().get_inbound_group_session(room_id, session_id).await.unwrap();
-
         assert_let!(Some(session) = session);
         assert!(
             session.backed_up(),
             "If a session was imported from a backup, it should be considered to be backed up"
         );
         assert!(session.has_been_imported());
+
+        // Also check that it is not returned by a backup request.
+        let backup_request =
+            backup_machine.backup().await.expect("We should be able to create a backup request");
+        assert!(
+            backup_request.is_none(),
+            "If a session was imported from backup, it should not be backed up again."
+        );
     }
 
     #[async_test]
@@ -843,5 +896,35 @@ mod tests {
         let result = backup_machine.verify_backup(backup_info, false).await.unwrap();
 
         assert!(result.trusted());
+    }
+
+    #[async_test]
+    async fn test_fix_backup_key_mismatch() {
+        let store = MemoryStore::new();
+
+        let backup_decryption_key = BackupDecryptionKey::new().unwrap();
+
+        store
+            .save_changes(Changes {
+                backup_decryption_key: Some(backup_decryption_key.clone()),
+                backup_version: Some("1".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Create the machine using `with_store` and without a call to enable_backup_v1,
+        // like regenerate_olm would do
+        let alice =
+            OlmMachine::with_store(alice_id(), alice_device_id(), store, None).await.unwrap();
+
+        let binding = alice.backup_machine().backup_key.read().await;
+        let machine_backup_key = binding.as_ref().unwrap();
+
+        assert_eq!(
+            machine_backup_key.to_base64(),
+            backup_decryption_key.megolm_v1_public_key().to_base64(),
+            "The OlmMachine loaded the wrong backup key."
+        );
     }
 }

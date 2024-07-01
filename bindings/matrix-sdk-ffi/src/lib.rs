@@ -20,10 +20,11 @@ macro_rules! unwrap_or_clone_arc_into_variant {
     };
 }
 
-mod authentication_service;
+mod authentication;
 mod chunk_iterator;
 mod client;
 mod client_builder;
+mod element;
 mod encryption;
 mod error;
 mod event;
@@ -36,6 +37,7 @@ mod room_directory_search;
 mod room_info;
 mod room_list;
 mod room_member;
+mod room_preview;
 mod ruma;
 mod session_verification;
 mod sync_service;

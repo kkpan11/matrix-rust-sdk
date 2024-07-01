@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
-
+use matrix_sdk::{
+    event_cache::{paginator::PaginatorError, EventCacheError},
+    send_queue::{RoomSendQueueError, RoomSendQueueStorageError},
+};
+use ruma::OwnedTransactionId;
 use thiserror::Error;
 
 /// Errors specific to the timeline.
@@ -28,23 +31,23 @@ pub enum Error {
     #[error("Event not found, can't retry sending")]
     RetryEventNotInTimeline,
 
-    /// The event is currently unsupported for this use case.
+    /// The event is currently unsupported for this use case..
     #[error("Unsupported event")]
     UnsupportedEvent,
 
-    /// Couldn't read the attachment data from the given URL
+    /// Couldn't read the attachment data from the given URL.
     #[error("Invalid attachment data")]
     InvalidAttachmentData,
 
-    /// The attachment file name used as a body is invalid
+    /// The attachment file name used as a body is invalid.
     #[error("Invalid attachment file name")]
     InvalidAttachmentFileName,
 
-    /// The attachment could not be sent
+    /// The attachment could not be sent.
     #[error("Failed sending attachment")]
     FailedSendingAttachment,
 
-    /// The reaction could not be toggled
+    /// The reaction could not be toggled.
     #[error("Failed toggling reaction")]
     FailedToToggleReaction,
 
@@ -52,58 +55,82 @@ pub enum Error {
     #[error("Room is not joined")]
     RoomNotJoined,
 
-    /// Could not get user
+    /// Could not get user.
     #[error("User ID is not available")]
     UserIdNotAvailable,
+
+    /// Something went wrong with the room event cache.
+    #[error("Something went wrong with the room event cache.")]
+    EventCacheError(#[from] EventCacheError),
+
+    /// An error happened during pagination.
+    #[error("An error happened during pagination.")]
+    PaginationError(#[from] PaginationError),
+
+    /// An error happened while operating the room's send queue.
+    #[error(transparent)]
+    SendQueueError(#[from] RoomSendQueueError),
 }
 
-#[derive(Error)]
-#[error("{0}")]
-pub struct UnsupportedReplyItem(UnsupportedReplyItemInner);
+#[derive(Error, Debug)]
+pub enum PaginationError {
+    /// The timeline isn't in the event focus mode.
+    #[error("The timeline isn't in the event focus mode")]
+    NotEventFocusMode,
 
-impl UnsupportedReplyItem {
-    pub(super) const MISSING_EVENT_ID: Self = Self(UnsupportedReplyItemInner::MissingEventId);
-    pub(super) const MISSING_JSON: Self = Self(UnsupportedReplyItemInner::MissingJson);
-}
-
-#[cfg(not(tarpaulin_include))]
-impl fmt::Debug for UnsupportedReplyItem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
+    /// An error occurred while paginating.
+    #[error("Error when paginating.")]
+    Paginator(#[source] PaginatorError),
 }
 
 #[derive(Debug, Error)]
-enum UnsupportedReplyItemInner {
+pub enum UnsupportedReplyItem {
     #[error("local messages whose event ID is not known can't be replied to currently")]
     MissingEventId,
     #[error("redacted events whose JSON form isn't available can't be replied")]
     MissingJson,
-}
-
-#[derive(Error)]
-#[error("{0}")]
-pub struct UnsupportedEditItem(UnsupportedEditItemInner);
-
-impl UnsupportedEditItem {
-    pub(super) const MISSING_EVENT_ID: Self = Self(UnsupportedEditItemInner::MissingEventId);
-    pub(super) const NOT_ROOM_MESSAGE: Self = Self(UnsupportedEditItemInner::NotRoomMessage);
-    pub(super) const NOT_POLL_EVENT: Self = Self(UnsupportedEditItemInner::NotPollEvent);
-}
-
-#[cfg(not(tarpaulin_include))]
-impl fmt::Debug for UnsupportedEditItem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
+    #[error("event to reply to not found")]
+    MissingEvent,
+    #[error("failed to deserialize event to reply to")]
+    FailedToDeserializeEvent,
+    #[error("tried to reply to a state event")]
+    StateEvent,
 }
 
 #[derive(Debug, Error)]
-enum UnsupportedEditItemInner {
-    #[error("local messages whose event ID is not known can't be edited currently")]
-    MissingEventId,
+pub enum UnsupportedEditItem {
     #[error("tried to edit a non-message event")]
     NotRoomMessage,
     #[error("tried to edit a non-poll event")]
     NotPollEvent,
+    #[error("tried to edit another user's event")]
+    NotOwnEvent,
+    #[error("event to edit not found")]
+    MissingEvent,
+    #[error("failed to deserialize event to edit")]
+    FailedToDeserializeEvent,
+}
+
+#[derive(Debug, Error)]
+pub enum SendEventError {
+    #[error(transparent)]
+    UnsupportedReplyItem(#[from] UnsupportedReplyItem),
+
+    #[error(transparent)]
+    UnsupportedEditItem(#[from] UnsupportedEditItem),
+
+    #[error(transparent)]
+    RoomQueueError(#[from] RoomSendQueueError),
+}
+
+#[derive(Debug, Error)]
+pub enum RedactEventError {
+    #[error("the given local event (with transaction id {0}) doesn't support redaction")]
+    UnsupportedRedactLocal(OwnedTransactionId),
+
+    #[error(transparent)]
+    SdkError(#[from] matrix_sdk::Error),
+
+    #[error("an error happened while interacting with the room queue")]
+    RoomQueueError(#[source] RoomSendQueueStorageError),
 }

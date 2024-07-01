@@ -27,8 +27,8 @@ use ruma::{
 use stream_assert::assert_next_matches;
 
 use crate::timeline::{
-    event_item::EventItemIdentifier,
-    inner::ReactionAction,
+    event_item::RemoteEventOrigin,
+    inner::{ReactionAction, TimelineEnd},
     reactions::ReactionToggleResult,
     tests::{assert_event_is_updated, assert_no_more_updates, TestTimeline},
     TimelineItem,
@@ -141,14 +141,12 @@ async fn test_redact_reaction_failure() {
 }
 
 #[async_test]
-async fn test_redact_reaction_from_non_existent_event() {
+async fn test_redact_reaction_from_non_existing_event() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
     let reaction_id = EventId::new(server_name!("example.org")); // non existent event
 
-    timeline
-        .handle_local_redaction_event(EventItemIdentifier::EventId(reaction_id), Default::default())
-        .await;
+    timeline.handle_local_redaction_event(&reaction_id).await;
 
     assert_no_more_updates(&mut stream).await;
 }
@@ -259,7 +257,8 @@ async fn test_initial_reaction_timestamp_is_stored() {
                     RoomMessageEventContent::text_plain("A"),
                 )),
             ],
-            crate::timeline::inner::TimelineEnd::Back { from_cache: false },
+            TimelineEnd::Back,
+            RemoteEventOrigin::Sync,
         )
         .await;
 
@@ -285,11 +284,13 @@ async fn send_first_message(
         .handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("I want you to react"))
         .await;
 
-    let _day_divider = assert_next_matches!(*stream, VectorDiff::PushBack { value } => value);
-
     let item = assert_next_matches!(*stream, VectorDiff::PushBack { value } => value);
     let event_id = item.as_event().unwrap().clone().event_id().unwrap().to_owned();
     let position = timeline.len().await - 1;
+
+    let day_divider = assert_next_matches!(*stream, VectorDiff::PushFront { value } => value);
+    assert!(day_divider.is_day_divider());
+
     (event_id, position)
 }
 

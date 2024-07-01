@@ -16,9 +16,9 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{pin::Pin, sync::Arc, task::Poll};
+use std::{path::PathBuf, pin::Pin, sync::Arc, task::Poll};
 
-use eyeball::{SharedObservable, Subscriber};
+use event_item::TimelineEventItemId;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use imbl::Vector;
@@ -28,6 +28,7 @@ use matrix_sdk::{
     event_handler::EventHandlerHandle,
     executor::JoinHandle,
     room::{Receipts, Room},
+    send_queue::{RoomSendQueueError, SendHandle},
     Client, Result,
 };
 use matrix_sdk_base::RoomState;
@@ -50,18 +51,20 @@ use ruma::{
             },
             redaction::RoomRedactionEventContent,
         },
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+        SyncMessageLikeEvent,
     },
-    uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, RoomVersionId,
-    TransactionId, UserId,
+    serde::Raw,
+    uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
+    RoomVersionId, TransactionId, UserId,
 };
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{error, instrument, trace, warn};
 
-use self::futures::SendAttachment;
+use self::{event_item::EventTimelineItemKind, futures::SendAttachment, util::rfind_event_item};
 
 mod builder;
+mod day_dividers;
 mod error;
 mod event_handler;
 mod event_item;
@@ -71,10 +74,8 @@ mod inner;
 mod item;
 mod pagination;
 mod polls;
-mod queue;
 mod reactions;
 mod read_receipts;
-mod sliding_sync_ext;
 #[cfg(test)]
 mod tests;
 #[cfg(feature = "e2e-encryption")]
@@ -85,7 +86,7 @@ mod virtual_item;
 
 pub use self::{
     builder::TimelineBuilder,
-    error::{Error, UnsupportedEditItem, UnsupportedReplyItem},
+    error::*,
     event_item::{
         AnyOtherFullStateEventContent, BundledReactions, EncryptedMessage, EventItemOrigin,
         EventSendState, EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange,
@@ -95,19 +96,67 @@ pub use self::{
     event_type_filter::TimelineEventTypeFilter,
     inner::default_event_filter,
     item::{TimelineItem, TimelineItemKind},
-    pagination::{BackPaginationStatus, PaginationOptions, PaginationOutcome},
+    pagination::LiveBackPaginationStatus,
     polls::PollResult,
     reactions::ReactionSenderData,
-    sliding_sync_ext::SlidingSyncRoomExt,
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
 use self::{
     inner::{ReactionAction, TimelineInner},
-    queue::LocalMessage,
     reactions::ReactionToggleResult,
     util::rfind_event_by_id,
 };
+
+/// Information needed to edit an event.
+#[derive(Debug, Clone)]
+pub struct EditInfo {
+    /// The event ID of the event that needs editing.
+    id: TimelineEventItemId,
+    /// The original content of the event that needs editing.
+    original_message: Message,
+}
+
+impl EditInfo {
+    /// The original content of the event that needs editing.
+    pub fn original_message(&self) -> &Message {
+        &self.original_message
+    }
+}
+
+/// Information needed to reply to an event.
+#[derive(Debug)]
+pub struct RepliedToInfo {
+    /// The event ID of the event to reply to.
+    event_id: OwnedEventId,
+    /// The sender of the event to reply to.
+    sender: OwnedUserId,
+    /// The timestamp of the event to reply to.
+    timestamp: MilliSecondsSinceUnixEpoch,
+    /// The content of the event to reply to.
+    content: ReplyContent,
+}
+
+impl RepliedToInfo {
+    /// The sender of the event to reply to.
+    pub fn sender(&self) -> &UserId {
+        &self.sender
+    }
+
+    /// The content of the event to reply to.
+    pub fn content(&self) -> &ReplyContent {
+        &self.content
+    }
+}
+
+/// The content of a reply.
+#[derive(Debug, Clone)]
+pub enum ReplyContent {
+    /// Content of a message event.
+    Message(Message),
+    /// Content of any other kind of event stored as raw JSON.
+    Raw(Raw<AnySyncTimelineEvent>),
+}
 
 /// A high-level view into a regular¹ room's contents.
 ///
@@ -122,13 +171,6 @@ pub struct Timeline {
 
     /// The event cache specialized for this room's view.
     event_cache: RoomEventCache,
-
-    /// Observable for whether a pagination is currently running
-    back_pagination_status: SharedObservable<BackPaginationStatus>,
-
-    /// A sender to the task which responsibility is to send messages to the
-    /// current room.
-    msg_sender: Sender<LocalMessage>,
 
     /// References to long-running tasks held by the timeline.
     drop_handle: Arc<TimelineDropHandle>,
@@ -147,6 +189,17 @@ impl From<&Annotation> for AnnotationKey {
     }
 }
 
+/// What should the timeline focus on?
+#[derive(Clone, Debug, PartialEq)]
+pub enum TimelineFocus {
+    /// Focus on live events, i.e. receive events from sync and append them in
+    /// real-time.
+    Live,
+
+    /// Focus on a specific event, e.g. after clicking a permalink.
+    Event { target: OwnedEventId, num_context_events: u16 },
+}
+
 impl Timeline {
     /// Create a new [`TimelineBuilder`] for the given room.
     pub fn builder(room: &Room) -> TimelineBuilder {
@@ -161,11 +214,6 @@ impl Timeline {
     /// Clear all timeline items.
     pub async fn clear(&self) {
         self.inner.clear().await;
-    }
-
-    /// Subscribe to the back-pagination status of the timeline.
-    pub fn back_pagination_status(&self) -> Subscriber<BackPaginationStatus> {
-        self.back_pagination_status.subscribe()
     }
 
     /// Retry decryption of previously un-decryptable events given a list of
@@ -213,6 +261,9 @@ impl Timeline {
 
     /// Get the current timeline item for the given event ID, if any.
     ///
+    /// Will return a remote event, *or* a local echo that has been sent but not
+    /// yet replaced by a remote echo.
+    ///
     /// It's preferable to store the timeline items in the model for your UI, if
     /// possible, instead of just storing IDs and coming back to the timeline
     /// object to look up items.
@@ -222,9 +273,31 @@ impl Timeline {
         Some(item.to_owned())
     }
 
+    /// Get the current timeline item for the given transaction ID, if any.
+    ///
+    /// This will always return a local echo, if found.
+    ///
+    /// It's preferable to store the timeline items in the model for your UI, if
+    /// possible, instead of just storing IDs and coming back to the timeline
+    /// object to look up items.
+    pub async fn item_by_transaction_id(
+        &self,
+        target: &TransactionId,
+    ) -> Option<EventTimelineItem> {
+        let items = self.inner.items().await;
+        let (_, item) = rfind_event_item(&items, |item| {
+            item.as_local().map_or(false, |local| local.transaction_id == target)
+        })?;
+        Some(item.to_owned())
+    }
+
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
-        self.inner.items().await.last()?.as_event().cloned()
+        if self.inner.is_live().await {
+            self.inner.items().await.last()?.as_event().cloned()
+        } else {
+            None
+        }
     }
 
     /// Get the current timeline items, and a stream of changes.
@@ -270,106 +343,176 @@ impl Timeline {
     /// [`MessageLikeUnsigned`]: ruma::events::MessageLikeUnsigned
     /// [`SyncMessageLikeEvent`]: ruma::events::SyncMessageLikeEvent
     #[instrument(skip(self, content), fields(room_id = ?self.room().room_id()))]
-    pub async fn send(&self, content: AnyMessageLikeEventContent) {
-        let txn_id = TransactionId::new();
-        self.inner.handle_local_event(txn_id.clone(), content.clone()).await;
-        if self.msg_sender.send(LocalMessage { content, txn_id }).await.is_err() {
-            error!("Internal error: timeline message receiver is closed");
-        }
+    pub async fn send(
+        &self,
+        content: AnyMessageLikeEventContent,
+    ) -> Result<SendHandle, RoomSendQueueError> {
+        self.room().send_queue().send(content).await
     }
 
     /// Send a reply to the given event.
     ///
-    /// Currently only supports events events with an event ID and JSON being
+    /// Currently it only supports events with an event ID and JSON being
     /// available (which can be removed by local redactions). This is subject to
     /// change. Please check [`EventTimelineItem::can_be_replied_to`] to decide
     /// whether to render a reply button.
     ///
-    /// If the `content.mentions` is `Some(_)`, the sender of `reply_item` will
-    /// be added to the mentions of the reply. If `content.mentions` is `None`,
-    /// it will be kept as-is.
+    /// The sender will be added to the mentions of the reply if
+    /// and only if the event has not been written by the sender.
     ///
     /// # Arguments
     ///
     /// * `content` - The content of the reply
     ///
-    /// * `reply_item` - The event item you want to reply to
+    /// * `replied_to_info` - A wrapper that contains the event ID, sender,
+    ///   content and timestamp of the event to reply to
     ///
     /// * `forward_thread` - Usually `Yes`, unless you explicitly want to the
     ///   reply to show up in the main timeline even though the `reply_item` is
     ///   part of a thread
-    #[instrument(skip(self, content, reply_item))]
+    #[instrument(skip(self, content, replied_to_info))]
     pub async fn send_reply(
         &self,
         content: RoomMessageEventContentWithoutRelation,
-        reply_item: &EventTimelineItem,
+        replied_to_info: RepliedToInfo,
         forward_thread: ForwardThread,
-    ) -> Result<(), UnsupportedReplyItem> {
-        // Error returns here must be in sync with
-        // `EventTimelineItem::can_be_replied_to`
-        let Some(event_id) = reply_item.event_id() else {
-            return Err(UnsupportedReplyItem::MISSING_EVENT_ID);
+    ) -> Result<(), RoomSendQueueError> {
+        let event_id = replied_to_info.event_id;
+
+        // [The specification](https://spec.matrix.org/v1.10/client-server-api/#user-and-room-mentions) says:
+        //
+        // > Users should not add their own Matrix ID to the `m.mentions` property as
+        // > outgoing messages cannot self-notify.
+        //
+        // If the replied to event has been written by the current user, let's toggle to
+        // `AddMentions::No`.
+        let mention_the_sender = if self.room().own_user_id() == replied_to_info.sender {
+            AddMentions::No
+        } else {
+            AddMentions::Yes
         };
 
-        let add_mentions =
-            if content.mentions.is_some() { AddMentions::Yes } else { AddMentions::No };
-
-        let content = match reply_item.content() {
-            TimelineItemContent::Message(msg) => {
+        let content = match replied_to_info.content {
+            ReplyContent::Message(msg) => {
                 let event = OriginalRoomMessageEvent {
                     event_id: event_id.to_owned(),
-                    sender: reply_item.sender().to_owned(),
-                    origin_server_ts: reply_item.timestamp(),
+                    sender: replied_to_info.sender,
+                    origin_server_ts: replied_to_info.timestamp,
                     room_id: self.room().room_id().to_owned(),
                     content: msg.to_content(),
                     unsigned: Default::default(),
                 };
-                content.make_reply_to(&event, forward_thread, add_mentions)
+                content.make_reply_to(&event, forward_thread, mention_the_sender)
             }
-            _ => {
-                let Some(raw_event) = reply_item.latest_json() else {
-                    return Err(UnsupportedReplyItem::MISSING_JSON);
-                };
-
-                content.make_reply_to_raw(
-                    raw_event,
-                    event_id.to_owned(),
-                    self.room().room_id(),
-                    forward_thread,
-                    add_mentions,
-                )
-            }
+            ReplyContent::Raw(raw_event) => content.make_reply_to_raw(
+                &raw_event,
+                event_id.to_owned(),
+                self.room().room_id(),
+                forward_thread,
+                mention_the_sender,
+            ),
         };
 
-        self.send(content.into()).await;
+        self.send(content.into()).await?;
+
         Ok(())
     }
 
-    /// Send an edit to the given event.
+    /// Get the information needed to reply to the event with the given ID.
+    pub async fn replied_to_info_from_event_id(
+        &self,
+        event_id: &EventId,
+    ) -> Result<RepliedToInfo, UnsupportedReplyItem> {
+        if let Some(timeline_item) = self.item_by_event_id(event_id).await {
+            return timeline_item.replied_to_info();
+        }
+
+        let event = self.room().event(event_id).await.map_err(|error| {
+            error!("Failed to fetch event with ID {event_id} with error: {error}");
+            UnsupportedReplyItem::MissingEvent
+        })?;
+
+        // We need to get the content and we can do that by casting the event as a
+        // `AnySyncTimelineEvent` which is the same as a `AnyTimelineEvent`, but without
+        // the `room_id` field. The cast is valid because we are just losing
+        // track of such field.
+        let raw_sync_event: Raw<AnySyncTimelineEvent> = event.event.cast();
+        let sync_event = raw_sync_event.deserialize().map_err(|error| {
+            error!("Failed to deserialize event with ID {event_id} with error: {error}");
+            UnsupportedReplyItem::FailedToDeserializeEvent
+        })?;
+
+        let reply_content = match &sync_event {
+            AnySyncTimelineEvent::MessageLike(message_like_event) => {
+                if let AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
+                    original_message,
+                )) = message_like_event
+                {
+                    ReplyContent::Message(Message::from_event(
+                        original_message.content.clone(),
+                        message_like_event.relations(),
+                        &self.items().await,
+                    ))
+                } else {
+                    ReplyContent::Raw(raw_sync_event)
+                }
+            }
+            AnySyncTimelineEvent::State(_) => return Err(UnsupportedReplyItem::StateEvent),
+        };
+
+        Ok(RepliedToInfo {
+            event_id: event_id.to_owned(),
+            sender: sync_event.sender().to_owned(),
+            timestamp: sync_event.origin_server_ts(),
+            content: reply_content,
+        })
+    }
+
+    /// Edit an event.
     ///
-    /// Currently only supports `m.room.message` events whose event ID is known.
-    /// Please check [`EventTimelineItem::can_be_edited`] before calling this.
+    /// Only supports events for which [`EventTimelineItem::is_editable()`]
+    /// returns `true`.
     ///
     /// # Arguments
     ///
-    /// * `new_content` - The content of the reply
+    /// * `new_content` - The new content of the event.
     ///
-    /// * `edit_item` - The event item you want to edit
+    /// * `edit_info` - A wrapper that contains the event ID and the content of
+    ///  the event to edit.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(true)` if the edit was added to the send queue. Returns
+    /// `Ok(false)` if the edit targets a local item but the edit could not be
+    /// applied, which could mean that the event was already sent. Returns an
+    /// error if there was an issue adding the edit to the send queue.
     #[instrument(skip(self, new_content))]
     pub async fn edit(
         &self,
-        new_content: RoomMessageEventContent,
-        edit_item: &EventTimelineItem,
-    ) -> Result<(), UnsupportedEditItem> {
-        // Early returns here must be in sync with
-        // `EventTimelineItem::can_be_edited`
-        let Some(event_id) = edit_item.event_id() else {
-            return Err(UnsupportedEditItem::MISSING_EVENT_ID);
-        };
-        let TimelineItemContent::Message(original_content) = edit_item.content() else {
-            return Err(UnsupportedEditItem::NOT_ROOM_MESSAGE);
+        new_content: RoomMessageEventContentWithoutRelation,
+        edit_info: EditInfo,
+    ) -> Result<bool, RoomSendQueueError> {
+        let event_id = match edit_info.id {
+            TimelineEventItemId::TransactionId(txn_id) => {
+                let Some(item) = self.item_by_transaction_id(&txn_id).await else {
+                    warn!("Couldn't find the local echo anymore");
+                    return Ok(false);
+                };
+
+                if let Some(handle) = item.as_local().and_then(|item| item.send_handle.clone()) {
+                    // Assume no relations, since it's not been sent yet.
+                    let new_content: RoomMessageEventContent = new_content.into();
+                    return Ok(handle.edit(new_content.into()).await?);
+                }
+
+                warn!("No handle for a local echo; should only happen in testing situations");
+                return Ok(false);
+            }
+
+            TimelineEventItemId::EventId(event_id) => event_id,
         };
 
+        let original_content = edit_info.original_message;
         let replied_to_message =
             original_content.in_reply_to().and_then(|details| match &details.event {
                 TimelineDetails::Ready(event) => match event.content() {
@@ -391,12 +534,61 @@ impl Timeline {
             });
 
         let content = new_content.make_replacement(
-            ReplacementMetadata::new(event_id.to_owned(), None),
+            ReplacementMetadata::new(event_id.to_owned(), original_content.mentions.clone()),
             replied_to_message.as_ref(),
         );
 
-        self.send(content.into()).await;
-        Ok(())
+        self.send(content.into()).await?;
+
+        Ok(true)
+    }
+
+    /// Get the information needed to edit the event with the given ID.
+    pub async fn edit_info_from_event_id(
+        &self,
+        event_id: &EventId,
+    ) -> Result<EditInfo, UnsupportedEditItem> {
+        if let Some(timeline_item) = self.item_by_event_id(event_id).await {
+            return timeline_item.edit_info();
+        }
+
+        let event = self.room().event(event_id).await.map_err(|error| {
+            error!("Failed to fetch event with ID {event_id} with error: {error}");
+            UnsupportedEditItem::MissingEvent
+        })?;
+
+        // We need to get the content and we can do that by casting
+        // the event as a `AnySyncTimelineEvent` which is the same as a
+        // `AnyTimelineEvent`, but without the `room_id` field.
+        // The cast is valid because we are just losing track of such field.
+        let raw_sync_event: Raw<AnySyncTimelineEvent> = event.event.cast();
+        let event = raw_sync_event.deserialize().map_err(|error| {
+            error!("Failed to deserialize event with ID {event_id} with error: {error}");
+            UnsupportedEditItem::FailedToDeserializeEvent
+        })?;
+
+        if event.sender() != self.room().own_user_id() {
+            return Err(UnsupportedEditItem::NotOwnEvent);
+        };
+
+        if let AnySyncTimelineEvent::MessageLike(message_like_event) = &event {
+            if let AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
+                original_message,
+            )) = message_like_event
+            {
+                let message = Message::from_event(
+                    original_message.content.clone(),
+                    message_like_event.relations(),
+                    &self.items().await,
+                );
+                return Ok(EditInfo {
+                    id: TimelineEventItemId::EventId(event_id.to_owned()),
+                    original_message: message,
+                });
+            }
+        }
+
+        Err(UnsupportedEditItem::NotRoomMessage)
     }
 
     pub async fn edit_poll(
@@ -404,20 +596,30 @@ impl Timeline {
         fallback_text: impl Into<String>,
         poll: UnstablePollStartContentBlock,
         edit_item: &EventTimelineItem,
-    ) -> Result<(), UnsupportedEditItem> {
+    ) -> Result<(), SendEventError> {
+        // TODO: refactor this function into [`Self::edit`], there's no good reason to
+        // keep a separate function for this.
+
+        // Early returns here must be in sync with `EventTimelineItem::is_editable`.
+        if !edit_item.is_own() {
+            return Err(UnsupportedEditItem::NotOwnEvent.into());
+        }
         let Some(event_id) = edit_item.event_id() else {
-            return Err(UnsupportedEditItem::MISSING_EVENT_ID);
-        };
-        let TimelineItemContent::Poll(_) = edit_item.content() else {
-            return Err(UnsupportedEditItem::NOT_POLL_EVENT);
+            return Err(UnsupportedEditItem::MissingEvent.into());
         };
 
-        let replacement_poll = ReplacementUnstablePollStartEventContent::plain_text(
+        let TimelineItemContent::Poll(_) = edit_item.content() else {
+            return Err(UnsupportedEditItem::NotPollEvent.into());
+        };
+
+        let content = ReplacementUnstablePollStartEventContent::plain_text(
             fallback_text,
             poll,
             event_id.into(),
         );
-        self.send(UnstablePollStartEventContent::from(replacement_poll).into()).await;
+
+        self.send(UnstablePollStartEventContent::from(content).into()).await?;
+
         Ok(())
     }
 
@@ -514,7 +716,7 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `filename` - The filename of the file to be sent
+    /// * `path` - The path of the file to be sent
     ///
     /// * `mime_type` - The attachment's mime type
     ///
@@ -525,82 +727,45 @@ impl Timeline {
     #[instrument(skip_all)]
     pub fn send_attachment(
         &self,
-        filename: String,
+        path: impl Into<PathBuf>,
         mime_type: Mime,
         config: AttachmentConfig,
     ) -> SendAttachment<'_> {
-        SendAttachment::new(self, filename, mime_type, config)
+        SendAttachment::new(self, path.into(), mime_type, config)
     }
 
-    /// Retry sending a message that previously failed to send.
+    /// Redacts an event from the timeline.
     ///
-    /// # Arguments
+    /// If it was a local event, this will *try* to cancel it, if it was not
+    /// being sent already. If the event was a remote event, then it will be
+    /// redacted by sending a redaction request to the server.
     ///
-    /// * `txn_id` - The transaction ID of a local echo timeline item that has a
-    ///   `send_state()` of `SendState::FailedToSend { .. }`
-    #[instrument(skip(self))]
-    pub async fn retry_send(&self, txn_id: &TransactionId) -> Result<(), Error> {
-        macro_rules! error_return {
-            ($msg:literal) => {{
-                error!($msg);
-                return Ok(());
-            }};
+    /// Returns whether the redaction did happen. It can only return false for
+    /// local events that are being processed.
+    pub async fn redact(
+        &self,
+        event: &EventTimelineItem,
+        reason: Option<&str>,
+    ) -> Result<bool, RedactEventError> {
+        match &event.kind {
+            EventTimelineItemKind::Local(local) => {
+                if let Some(handle) = local.send_handle.clone() {
+                    Ok(handle.abort().await.map_err(RedactEventError::RoomQueueError)?)
+                } else {
+                    // No abort handle; theoretically unreachable for regular usage of the
+                    // timeline, but this may happen in testing contexts.
+                    Err(RedactEventError::UnsupportedRedactLocal(local.transaction_id.clone()))
+                }
+            }
+
+            EventTimelineItemKind::Remote(remote) => {
+                self.room()
+                    .redact(&remote.event_id, reason, None)
+                    .await
+                    .map_err(|err| RedactEventError::SdkError(err.into()))?;
+                Ok(true)
+            }
         }
-
-        let item = self.inner.prepare_retry(txn_id).await.ok_or(Error::RetryEventNotInTimeline)?;
-        let content = match item {
-            TimelineItemContent::Message(msg) => {
-                AnyMessageLikeEventContent::RoomMessage(msg.into())
-            }
-            TimelineItemContent::RedactedMessage => {
-                error_return!("Invalid state: attempting to retry a redacted message");
-            }
-            TimelineItemContent::Sticker(sticker) => {
-                AnyMessageLikeEventContent::Sticker(sticker.content)
-            }
-            TimelineItemContent::UnableToDecrypt(_) => {
-                error_return!("Invalid state: attempting to retry a UTD item");
-            }
-            TimelineItemContent::MembershipChange(_)
-            | TimelineItemContent::ProfileChange(_)
-            | TimelineItemContent::OtherState(_) => {
-                error_return!("Retrying state events is not currently supported");
-            }
-            TimelineItemContent::FailedToParseMessageLike { .. }
-            | TimelineItemContent::FailedToParseState { .. } => {
-                error_return!("Invalid state: attempting to retry a failed-to-parse item");
-            }
-            TimelineItemContent::Poll(poll_state) => AnyMessageLikeEventContent::UnstablePollStart(
-                UnstablePollStartEventContent::New(poll_state.into()),
-            ),
-            TimelineItemContent::CallInvite => {
-                error_return!("Retrying call events is not currently supported");
-            }
-        };
-
-        debug!("Retrying failed local echo");
-        let txn_id = txn_id.to_owned();
-        if self.msg_sender.send(LocalMessage { content, txn_id }).await.is_err() {
-            error!("Internal error: timeline message receiver is closed");
-        }
-
-        Ok(())
-    }
-
-    /// Discard a local echo for a message that failed to send.
-    ///
-    /// Returns whether the local echo with the given transaction ID was found.
-    ///
-    /// # Argument
-    ///
-    /// * `txn_id` - The transaction ID of a local echo timeline item that has a
-    ///   `send_state()` of `SendState::FailedToSend { .. }`. *Note:* A send
-    ///   state of `SendState::NotYetSent` might be supported in the future as
-    ///   well, but there can be no guarantee for that actually stopping the
-    ///   event from reaching the server.
-    #[instrument(skip(self))]
-    pub async fn cancel_send(&self, txn_id: &TransactionId) -> bool {
-        self.inner.discard_local_echo(txn_id).await
     }
 
     /// Fetch unavailable details about the event with the given ID.
@@ -792,8 +957,8 @@ struct TimelineDropHandle {
     client: Client,
     event_handler_handles: Vec<EventHandlerHandle>,
     room_update_join_handle: JoinHandle<()>,
-    ignore_user_list_update_join_handle: JoinHandle<()>,
     room_key_from_backups_join_handle: JoinHandle<()>,
+    local_echo_listener_handle: Option<JoinHandle<()>>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
 }
 
@@ -802,8 +967,10 @@ impl Drop for TimelineDropHandle {
         for handle in self.event_handler_handles.drain(..) {
             self.client.remove_event_handler(handle);
         }
+        if let Some(handle) = self.local_echo_listener_handle.take() {
+            handle.abort()
+        };
         self.room_update_join_handle.abort();
-        self.ignore_user_list_update_join_handle.abort();
         self.room_key_from_backups_join_handle.abort();
     }
 }

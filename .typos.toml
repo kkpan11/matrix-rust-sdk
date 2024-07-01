@@ -21,8 +21,13 @@ WeeChat = "WeeChat"
 sing = "sign"
 singed = "signed"
 singing = "signing"
-Nd = "Nd"
 ratatui = "ratatui"
+# base64 false positives
+Nd = "Nd"
+Abl = "Abl"
+Som = "Som"
+Ba = "Ba"
+Yur = "Yur" # as found in crates/matrix-sdk-indexeddb/src/crypto_store/migrations/mod.rs
 
 [files]
 extend-exclude = [
@@ -30,6 +35,4 @@ extend-exclude = [
     "*.json",
     # Fuzzy match patterns that can be understood as typos confusingly.
     "crates/matrix-sdk-ui/tests/integration/room_list_service.rs",
-    # Hand-crafted base64 session keys that are understood as typos.
-    "crates/matrix-sdk-indexeddb/src/crypto_store/migrations/mod.rs",
 ]

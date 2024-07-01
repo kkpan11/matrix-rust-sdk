@@ -16,15 +16,12 @@ use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use eyeball_im::{ObservableVector, ObservableVectorTransaction, ObservableVectorTransactionEntry};
 use indexmap::IndexMap;
-use matrix_sdk::deserialized_responses::SyncTimelineEvent;
+use matrix_sdk::{deserialized_responses::SyncTimelineEvent, send_queue::SendHandle};
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
-    events::{
-        relation::Annotation, room::redaction::RoomRedactionEventContent,
-        AnyMessageLikeEventContent, AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent,
-    },
+    events::{relation::Annotation, AnySyncEphemeralRoomEvent},
     push::Action,
     serde::Raw,
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
@@ -36,18 +33,19 @@ use super::{HandleManyEventsResult, ReactionState, TimelineInnerSettings};
 use crate::{
     events::SyncTimelineEventWithoutContent,
     timeline::{
+        day_dividers::DayDividerAdjuster,
         event_handler::{
             Flow, HandleEventResult, TimelineEventContext, TimelineEventHandler, TimelineEventKind,
             TimelineItemPosition,
         },
-        event_item::EventItemIdentifier,
+        event_item::{RemoteEventOrigin, TimelineEventItemId},
         polls::PollPendingEvents,
         reactions::{ReactionToggleResult, Reactions},
         read_receipts::ReadReceipts,
         traits::RoomDataProvider,
-        util::{rfind_event_by_id, rfind_event_item, timestamp_to_date, RelativePosition},
+        util::{rfind_event_by_id, rfind_event_item, RelativePosition},
         AnnotationKey, Error as TimelineError, Profile, ReactionSenderData, TimelineItem,
-        TimelineItemKind, VirtualTimelineItem,
+        TimelineItemKind,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -61,21 +59,23 @@ pub(crate) enum TimelineEnd {
     /// Event should be prepended to the front of the timeline.
     Front,
     /// Event should appended to the back of the timeline.
-    Back {
-        /// Did the event come from the cache?
-        from_cache: bool,
-    },
+    Back,
 }
 
 #[derive(Debug)]
 pub(in crate::timeline) struct TimelineInnerState {
     pub items: ObservableVector<Arc<TimelineItem>>,
     pub meta: TimelineInnerMetadata,
+
+    /// Is the timeline focused on a live view?
+    pub is_live_timeline: bool,
 }
 
 impl TimelineInnerState {
     pub(super) fn new(
         room_version: RoomVersionId,
+        is_live_timeline: bool,
+        internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
     ) -> Self {
         Self {
@@ -83,16 +83,26 @@ impl TimelineInnerState {
             // sliding-sync tests with 20 events lag. This should still be
             // small enough.
             items: ObservableVector::with_capacity(32),
-            meta: TimelineInnerMetadata::new(room_version, unable_to_decrypt_hook),
+            meta: TimelineInnerMetadata::new(
+                room_version,
+                internal_id_prefix,
+                unable_to_decrypt_hook,
+            ),
+            is_live_timeline,
         }
     }
 
-    /// Add the given events at the given end of the timeline.
+    /// Add the given remove events at the given end of the timeline.
+    ///
+    /// Note: when the `position` is [`TimelineEnd::Front`], prepended events
+    /// should be ordered in *reverse* topological order, that is, `events[0]`
+    /// is the most recent.
     #[tracing::instrument(skip(self, events, room_data_provider, settings))]
-    pub(super) async fn add_events_at<P: RoomDataProvider>(
+    pub(super) async fn add_remote_events_at<P: RoomDataProvider>(
         &mut self,
         events: Vec<impl Into<SyncTimelineEvent>>,
         position: TimelineEnd,
+        origin: RemoteEventOrigin,
         room_data_provider: &P,
         settings: &TimelineInnerSettings,
     ) -> HandleManyEventsResult {
@@ -102,58 +112,43 @@ impl TimelineInnerState {
 
         let mut txn = self.transaction();
         let handle_many_res =
-            txn.add_events_at(events, position, room_data_provider, settings).await;
+            txn.add_remote_events_at(events, position, origin, room_data_provider, settings).await;
         txn.commit();
 
         handle_many_res
     }
 
+    /// Marks the given event as fully read, using the read marker received from
+    /// sync.
+    pub(super) fn handle_fully_read_marker(&mut self, fully_read_event_id: OwnedEventId) {
+        let mut txn = self.transaction();
+        txn.set_fully_read_event(fully_read_event_id);
+        txn.commit();
+    }
+
     #[instrument(skip_all)]
-    pub(super) async fn handle_sync_events<P: RoomDataProvider>(
+    pub(super) async fn handle_ephemeral_events<P: RoomDataProvider>(
         &mut self,
-        events: Vec<SyncTimelineEvent>,
-        account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
-        ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+        events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
     ) {
+        if events.is_empty() {
+            return;
+        }
+
         let mut txn = self.transaction();
 
-        txn.add_events_at(
-            events,
-            TimelineEnd::Back { from_cache: false },
-            room_data_provider,
-            settings,
-        )
-        .await;
-
-        trace!("Handling account data");
-        for raw_event in account_data {
+        trace!("Handling ephemeral room events");
+        let own_user_id = room_data_provider.own_user_id();
+        for raw_event in events {
             match raw_event.deserialize() {
-                Ok(AnyRoomAccountDataEvent::FullyRead(ev)) => {
-                    txn.set_fully_read_event(ev.content.event_id);
+                Ok(AnySyncEphemeralRoomEvent::Receipt(ev)) => {
+                    txn.handle_explicit_read_receipts(ev.content, own_user_id);
                 }
                 Ok(_) => {}
                 Err(e) => {
                     let event_type = raw_event.get_field::<String>("type").ok().flatten();
-                    warn!(event_type, "Failed to deserialize account data: {e}");
-                }
-            }
-        }
-
-        if !ephemeral.is_empty() {
-            trace!("Handling ephemeral room events");
-            let own_user_id = room_data_provider.own_user_id();
-            for raw_event in ephemeral {
-                match raw_event.deserialize() {
-                    Ok(AnySyncEphemeralRoomEvent::Receipt(ev)) => {
-                        txn.handle_explicit_read_receipts(ev.content, own_user_id);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        let event_type = raw_event.get_field::<String>("type").ok().flatten();
-                        warn!(event_type, "Failed to deserialize ephemeral event: {e}");
-                    }
+                    warn!(event_type, "Failed to deserialize ephemeral event: {e}");
                 }
             }
         }
@@ -161,42 +156,15 @@ impl TimelineInnerState {
         txn.commit();
     }
 
-    /// Handle the creation of a new local event.
-    pub(super) fn handle_local_event(
-        &mut self,
-        own_user_id: OwnedUserId,
-        own_profile: Option<Profile>,
-        txn_id: OwnedTransactionId,
-        content: AnyMessageLikeEventContent,
-    ) {
-        let ctx = TimelineEventContext {
-            sender: own_user_id,
-            sender_profile: own_profile,
-            timestamp: MilliSecondsSinceUnixEpoch::now(),
-            is_own_event: true,
-            // FIXME: Should we supply something here for encrypted rooms?
-            encryption_info: None,
-            read_receipts: Default::default(),
-            // An event sent by ourself is never matched against push rules.
-            is_highlighted: false,
-            flow: Flow::Local { txn_id },
-        };
-
-        let mut txn = self.transaction();
-        TimelineEventHandler::new(&mut txn, ctx)
-            .handle_event(TimelineEventKind::Message { content, relations: Default::default() });
-        txn.commit();
-    }
-
-    /// Handle the local redaction of an event.
+    /// Adds a local echo (for an event) to the timeline.
     #[instrument(skip_all)]
-    pub(super) fn handle_local_redaction(
+    pub(super) async fn handle_local_event(
         &mut self,
         own_user_id: OwnedUserId,
         own_profile: Option<Profile>,
         txn_id: OwnedTransactionId,
-        to_redact: EventItemIdentifier,
-        content: RoomRedactionEventContent,
+        send_handle: Option<SendHandle>,
+        content: TimelineEventKind,
     ) {
         let ctx = TimelineEventContext {
             sender: own_user_id,
@@ -208,24 +176,24 @@ impl TimelineInnerState {
             read_receipts: Default::default(),
             // An event sent by ourself is never matched against push rules.
             is_highlighted: false,
-            flow: Flow::Local { txn_id: txn_id.clone() },
+            flow: Flow::Local { txn_id, send_handle },
         };
 
         let mut txn = self.transaction();
-        let timeline_event_handler = TimelineEventHandler::new(&mut txn, ctx);
 
-        match to_redact {
-            EventItemIdentifier::TransactionId(txn_id) => {
-                timeline_event_handler.handle_event(TimelineEventKind::LocalRedaction {
-                    redacts: txn_id,
-                    content: content.clone(),
-                });
-            }
-            EventItemIdentifier::EventId(event_id) => {
-                timeline_event_handler
-                    .handle_event(TimelineEventKind::Redaction { redacts: event_id, content });
-            }
-        }
+        let mut day_divider_adjuster = DayDividerAdjuster::default();
+
+        TimelineEventHandler::new(&mut txn, ctx)
+            .handle_event(
+                &mut day_divider_adjuster,
+                content,
+                // Local events are never UTD, so no need to pass in a raw_event - this is only
+                // used to determine the type of UTD if there is one.
+                None,
+            )
+            .await;
+
+        txn.adjust_day_dividers(day_divider_adjuster);
 
         txn.commit();
     }
@@ -242,6 +210,8 @@ impl TimelineInnerState {
         Fut: Future<Output = Option<TimelineEvent>>,
     {
         let mut txn = self.transaction();
+
+        let mut day_divider_adjuster = DayDividerAdjuster::default();
 
         // Loop through all the indices, in order so we don't decrypt edits
         // before the event being edited, if both were UTD. Keep track of
@@ -263,6 +233,7 @@ impl TimelineInnerState {
                     TimelineItemPosition::Update(idx),
                     room_data_provider,
                     settings,
+                    &mut day_divider_adjuster,
                 )
                 .await;
 
@@ -272,6 +243,8 @@ impl TimelineInnerState {
                 offset += 1;
             }
         }
+
+        txn.adjust_day_dividers(day_divider_adjuster);
 
         txn.commit();
     }
@@ -321,7 +294,7 @@ impl TimelineInnerState {
 
             // Remove the local echo from the related event.
             if let Some(txn_id) = local_echo_to_remove {
-                let id = EventItemIdentifier::TransactionId(txn_id.clone());
+                let id = TimelineEventItemId::TransactionId(txn_id.clone());
                 if reaction_group.0.swap_remove(&id).is_none() {
                     warn!(
                         "Tried to remove reaction by transaction ID, but didn't \
@@ -333,7 +306,7 @@ impl TimelineInnerState {
             // Add the remote echo to the related event
             if let Some(event_id) = remote_echo_to_add {
                 reaction_group.0.insert(
-                    EventItemIdentifier::EventId(event_id.clone()),
+                    TimelineEventItemId::EventId(event_id.clone()),
                     reaction_sender_data.clone(),
                 );
             };
@@ -351,7 +324,7 @@ impl TimelineInnerState {
             // Remove the local echo from reaction_map
             // (should the local echo already be up-to-date after event handling?)
             if let Some(txn_id) = local_echo_to_remove {
-                let id = EventItemIdentifier::TransactionId(txn_id.clone());
+                let id = TimelineEventItemId::TransactionId(txn_id.clone());
                 if self.meta.reactions.map.remove(&id).is_none() {
                     warn!(
                         "Tried to remove reaction by transaction ID, but didn't \
@@ -362,13 +335,13 @@ impl TimelineInnerState {
             // Add the remote echo to the reaction_map
             if let Some(event_id) = remote_echo_to_add {
                 self.meta.reactions.map.insert(
-                    EventItemIdentifier::EventId(event_id.clone()),
+                    TimelineEventItemId::EventId(event_id.clone()),
                     (reaction_sender_data, annotation.clone()),
                 );
             }
         }
 
-        let item = TimelineItem::new(new_related, related.internal_id);
+        let item = TimelineItem::new(new_related, related.internal_id.to_owned());
         self.items.set(idx, item);
 
         Ok(())
@@ -397,10 +370,15 @@ impl TimelineInnerState {
         txn.commit();
     }
 
-    fn transaction(&mut self) -> TimelineInnerStateTransaction<'_> {
+    pub(super) fn transaction(&mut self) -> TimelineInnerStateTransaction<'_> {
         let items = self.items.transaction();
         let meta = self.meta.clone();
-        TimelineInnerStateTransaction { items, previous_meta: &mut self.meta, meta }
+        TimelineInnerStateTransaction {
+            items,
+            previous_meta: &mut self.meta,
+            meta,
+            is_live_timeline: self.is_live_timeline,
+        }
     }
 }
 
@@ -414,35 +392,61 @@ pub(in crate::timeline) struct TimelineInnerStateTransaction<'a> {
     /// [`Self::commit`].
     pub meta: TimelineInnerMetadata,
 
+    /// Is the timeline focused on a live view?
+    pub is_live_timeline: bool,
+
     /// Pointer to the previous meta, only used during [`Self::commit`].
     previous_meta: &'a mut TimelineInnerMetadata,
 }
 
 impl TimelineInnerStateTransaction<'_> {
-    /// Add the given events at the given end of the timeline.
+    /// Add the given remote events at the given end of the timeline.
+    ///
+    /// Note: when the `position` is [`TimelineEnd::Front`], prepended events
+    /// should be ordered in *reverse* topological order, that is, `events[0]`
+    /// is the most recent.
     #[tracing::instrument(skip(self, events, room_data_provider, settings))]
-    pub(super) async fn add_events_at<P: RoomDataProvider>(
+    pub(super) async fn add_remote_events_at<P: RoomDataProvider>(
         &mut self,
         events: Vec<impl Into<SyncTimelineEvent>>,
         position: TimelineEnd,
+        origin: RemoteEventOrigin,
         room_data_provider: &P,
         settings: &TimelineInnerSettings,
     ) -> HandleManyEventsResult {
         let mut total = HandleManyEventsResult::default();
 
         let position = match position {
-            TimelineEnd::Front => TimelineItemPosition::Start,
-            TimelineEnd::Back { from_cache } => TimelineItemPosition::End { from_cache },
+            TimelineEnd::Front => TimelineItemPosition::Start { origin },
+            TimelineEnd::Back => TimelineItemPosition::End { origin },
         };
+
+        let mut day_divider_adjuster = DayDividerAdjuster::default();
+
+        // Implementation note: when `position` is `TimelineEnd::Front`, events are in
+        // the reverse topological order. Prepending them one by one in the order they
+        // appear in the vector will thus result in the correct order.
+        //
+        // For instance, if the new events are : [C, B, A], where C is the most recent
+        // and A is the oldest: we prepend C, then prepend B, then prepend A,
+        // resulting in [A, B, C, (previous events)], which is what we want.
 
         for event in events {
             let handle_one_res = self
-                .handle_remote_event(event.into(), position, room_data_provider, settings)
+                .handle_remote_event(
+                    event.into(),
+                    position,
+                    room_data_provider,
+                    settings,
+                    &mut day_divider_adjuster,
+                )
                 .await;
 
             total.items_added += handle_one_res.item_added as u64;
             total.items_updated += handle_one_res.items_updated as u64;
         }
+
+        self.adjust_day_dividers(day_divider_adjuster);
 
         total
     }
@@ -456,6 +460,7 @@ impl TimelineInnerStateTransaction<'_> {
         position: TimelineItemPosition,
         room_data_provider: &P,
         settings: &TimelineInnerSettings,
+        day_divider_adjuster: &mut DayDividerAdjuster,
     ) -> HandleEventResult {
         let raw = event.event;
         let (event_id, sender, timestamp, txn_id, event_kind, should_add) = match raw.deserialize()
@@ -496,7 +501,9 @@ impl TimelineInnerStateTransaction<'_> {
                         timestamp: Some(event.origin_server_ts()),
                         visible: false,
                     };
-                    self.add_event(event_meta, position, room_data_provider, settings).await;
+                    let _event_added_or_updated = self
+                        .add_or_update_event(event_meta, position, room_data_provider, settings)
+                        .await;
 
                     return HandleEventResult::default();
                 }
@@ -521,7 +528,9 @@ impl TimelineInnerStateTransaction<'_> {
                             timestamp,
                             visible: false,
                         };
-                        self.add_event(event_meta, position, room_data_provider, settings).await;
+                        let _event_added_or_updated = self
+                            .add_or_update_event(event_meta, position, room_data_provider, settings)
+                            .await;
                     }
 
                     return HandleEventResult::default();
@@ -538,7 +547,15 @@ impl TimelineInnerStateTransaction<'_> {
             timestamp: Some(timestamp),
             visible: should_add,
         };
-        self.add_event(event_meta, position, room_data_provider, settings).await;
+
+        let event_added_or_updated =
+            self.add_or_update_event(event_meta, position, room_data_provider, settings).await;
+
+        // If the event has not been added or updated, it's because it's a duplicated
+        // event. Let's return early.
+        if !event_added_or_updated {
+            return HandleEventResult::default();
+        }
 
         let sender_profile = room_data_provider.profile_from_user_id(&sender).await;
         let ctx = TimelineEventContext {
@@ -559,14 +576,16 @@ impl TimelineInnerStateTransaction<'_> {
             is_highlighted: event.push_actions.iter().any(Action::is_highlight),
             flow: Flow::Remote {
                 event_id: event_id.clone(),
-                raw_event: raw,
+                raw_event: raw.clone(),
                 txn_id,
                 position,
                 should_add,
             },
         };
 
-        TimelineEventHandler::new(self, ctx).handle_event(event_kind)
+        TimelineEventHandler::new(self, ctx)
+            .handle_event(day_divider_adjuster, event_kind, Some(&raw))
+            .await
     }
 
     fn clear(&mut self) {
@@ -621,8 +640,8 @@ impl TimelineInnerStateTransaction<'_> {
         self.meta.update_read_marker(&mut self.items);
     }
 
-    fn commit(self) {
-        let Self { items, previous_meta, meta } = self;
+    pub(super) fn commit(self) {
+        let Self { items, previous_meta, meta, .. } = self;
 
         // Replace the pointer to the previous meta with the new one.
         *previous_meta = meta;
@@ -630,25 +649,50 @@ impl TimelineInnerStateTransaction<'_> {
         items.commit();
     }
 
-    async fn add_event<P: RoomDataProvider>(
+    /// Add or update an event in the [`TimelineInnerMeta::all_events`]
+    /// collection.
+    ///
+    /// This method also adjusts read receipt if needed.
+    ///
+    /// It returns `true` if the event has been added or updated, `false`
+    /// otherwise. The latter happens if the event already exists, i.e. if
+    /// an existing event is requested to be added.
+    async fn add_or_update_event<P: RoomDataProvider>(
         &mut self,
         event_meta: FullEventMeta<'_>,
         position: TimelineItemPosition,
         room_data_provider: &P,
         settings: &TimelineInnerSettings,
-    ) {
+    ) -> bool {
+        // Detect if an event already exists in [`TimelineInnerMeta::all_events`].
+        //
+        // Returns its position, in this case.
+        fn event_already_exists(
+            new_event_id: &EventId,
+            all_events: &VecDeque<EventMeta>,
+        ) -> Option<usize> {
+            all_events.iter().position(|EventMeta { event_id, .. }| event_id == new_event_id)
+        }
+
         match position {
-            TimelineItemPosition::Start => self.meta.all_events.push_front(event_meta.base_meta()),
+            TimelineItemPosition::Start { .. } => {
+                if let Some(pos) = event_already_exists(event_meta.event_id, &self.meta.all_events)
+                {
+                    self.meta.all_events.remove(pos);
+                }
+
+                self.meta.all_events.push_front(event_meta.base_meta())
+            }
+
             TimelineItemPosition::End { .. } => {
-                // Handle duplicated event.
-                if let Some(pos) =
-                    self.meta.all_events.iter().position(|ev| ev.event_id == event_meta.event_id)
+                if let Some(pos) = event_already_exists(event_meta.event_id, &self.meta.all_events)
                 {
                     self.meta.all_events.remove(pos);
                 }
 
                 self.meta.all_events.push_back(event_meta.base_meta());
             }
+
             #[cfg(feature = "e2e-encryption")]
             TimelineItemPosition::Update(_) => {
                 if let Some(event) =
@@ -668,12 +712,21 @@ impl TimelineInnerStateTransaction<'_> {
         }
 
         if settings.track_read_receipts
-            && matches!(position, TimelineItemPosition::Start | TimelineItemPosition::End { .. })
+            && matches!(
+                position,
+                TimelineItemPosition::Start { .. } | TimelineItemPosition::End { .. }
+            )
         {
             self.load_read_receipts_for_event(event_meta.event_id, room_data_provider).await;
 
             self.maybe_add_implicit_read_receipt(event_meta);
         }
+
+        true
+    }
+
+    fn adjust_day_dividers(&mut self, mut adjuster: DayDividerAdjuster) {
+        adjuster.run(&mut self.items, &mut self.meta);
     }
 }
 
@@ -686,6 +739,10 @@ pub(in crate::timeline) struct TimelineInnerMetadata {
     /// The next internal identifier for timeline items, used for both local and
     /// remote echoes.
     next_internal_id: u64,
+
+    /// An optional prefix for internal IDs, defined during construction of the
+    /// timeline.
+    internal_id_prefix: Option<String>,
 
     pub reactions: Reactions,
     pub poll_pending_events: PollPendingEvents,
@@ -714,8 +771,9 @@ pub(in crate::timeline) struct TimelineInnerMetadata {
 }
 
 impl TimelineInnerMetadata {
-    fn new(
+    pub(crate) fn new(
         room_version: RoomVersionId,
+        internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
     ) -> Self {
         Self {
@@ -732,6 +790,7 @@ impl TimelineInnerMetadata {
             in_flight_reaction: Default::default(),
             room_version,
             unable_to_decrypt_hook,
+            internal_id_prefix,
         }
     }
 
@@ -766,26 +825,16 @@ impl TimelineInnerMetadata {
 
     /// Returns the next internal id for a timeline item (and increment our
     /// internal counter).
-    pub fn next_internal_id(&mut self) -> u64 {
+    fn next_internal_id(&mut self) -> String {
         let val = self.next_internal_id;
         self.next_internal_id += 1;
-        val
+        let prefix = self.internal_id_prefix.as_deref().unwrap_or("");
+        format!("{prefix}{val}")
     }
 
     /// Returns a new timeline item with a fresh internal id.
     pub fn new_timeline_item(&mut self, kind: impl Into<TimelineItemKind>) -> Arc<TimelineItem> {
         TimelineItem::new(kind, self.next_internal_id())
-    }
-
-    /// Returns a new day divider item for the new timestamp if it is on a
-    /// different day than the old timestamp
-    pub fn maybe_create_day_divider_from_timestamps(
-        &mut self,
-        old_ts: MilliSecondsSinceUnixEpoch,
-        new_ts: MilliSecondsSinceUnixEpoch,
-    ) -> Option<Arc<TimelineItem>> {
-        (timestamp_to_date(old_ts) != timestamp_to_date(new_ts))
-            .then(|| self.new_timeline_item(VirtualTimelineItem::DayDivider(new_ts)))
     }
 
     /// Try to update the read marker item in the timeline.

@@ -21,6 +21,10 @@ use std::{
 use std::{ops::Deref, sync::Arc};
 
 use eyeball::{SharedObservable, Subscriber};
+#[cfg(not(target_arch = "wasm32"))]
+use eyeball_im::{Vector, VectorDiff};
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::Stream;
 use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
@@ -32,13 +36,15 @@ use ruma::events::{
     room::{history_visibility::HistoryVisibility, message::MessageType},
     SyncMessageLikeEvent,
 };
+#[cfg(doc)]
+use ruma::DeviceId;
 use ruma::{
     api::client as api,
     events::{
         ignored_user_list::IgnoredUserListEvent,
         push_rules::{PushRulesEvent, PushRulesEventContent},
         room::{
-            member::{MembershipState, SyncRoomMemberEvent},
+            member::{MembershipState, RoomMemberEventContent, SyncRoomMemberEvent},
             power_levels::{
                 RoomPowerLevelsEvent, RoomPowerLevelsEventContent, StrippedRoomPowerLevelsEvent,
             },
@@ -46,6 +52,7 @@ use ruma::{
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
         AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent, AnySyncStateEvent,
         AnySyncTimelineEvent, GlobalAccountDataEventType, StateEvent, StateEventType,
+        SyncStateEvent,
     },
     push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
@@ -121,10 +128,9 @@ impl BaseClient {
     /// # Arguments
     ///
     /// * `config` - An optional session if the user already has one from a
-    /// previous login call.
+    ///   previous login call.
     pub fn with_store_config(config: StoreConfig) -> Self {
-        let (roominfo_update_sender, _roominfo_update_receiver) =
-            tokio::sync::broadcast::channel(100);
+        let (roominfo_update_sender, _roominfo_update_receiver) = broadcast::channel(100);
 
         BaseClient {
             store: Store::new(config.state_store),
@@ -158,25 +164,26 @@ impl BaseClient {
     }
 
     /// Get all the rooms this client knows about.
-    pub fn get_rooms(&self) -> Vec<Room> {
-        self.store.get_rooms()
+    pub fn rooms(&self) -> Vec<Room> {
+        self.store.rooms()
     }
 
     /// Get all the rooms this client knows about, filtered by room state.
-    pub fn get_rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
-        self.store.get_rooms_filtered(filter)
+    pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
+        self.store.rooms_filtered(filter)
+    }
+
+    /// Get a stream of all the rooms changes, in addition to the existing
+    /// rooms.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>>) {
+        self.store.rooms_stream()
     }
 
     /// Lookup the Room for the given RoomId, or create one, if it didn't exist
     /// yet in the store
     pub fn get_or_create_room(&self, room_id: &RoomId, room_state: RoomState) -> Room {
         self.store.get_or_create_room(room_id, room_state, self.roominfo_update_sender.clone())
-    }
-
-    /// Get all the rooms this client knows about.
-    #[deprecated = "Use get_rooms_filtered with RoomStateFilter::INVITED instead."]
-    pub fn get_stripped_rooms(&self) -> Vec<Room> {
-        self.get_rooms_filtered(RoomStateFilter::INVITED)
     }
 
     /// Get a reference to the store.
@@ -200,13 +207,28 @@ impl BaseClient {
     /// * `session_meta` - The meta of a session that the user already has from
     ///   a previous login call.
     ///
+    /// * `custom_account` - A custom
+    ///   [`matrix_sdk_crypto::vodozemac::olm::Account`] to be used for the
+    ///   identity and one-time keys of this [`BaseClient`]. If no account is
+    ///   provided, a new default one or one from the store will be used. If an
+    ///   account is provided and one already exists in the store for this
+    ///   [`UserId`]/[`DeviceId`] combination, an error will be raised. This is
+    ///   useful if one wishes to create identity keys before knowing the
+    ///   user/device IDs, e.g., to use the identity key as the device ID.
+    ///
     /// This method panics if it is called twice.
-    pub async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
+    pub async fn set_session_meta(
+        &self,
+        session_meta: SessionMeta,
+        #[cfg(feature = "e2e-encryption")] custom_account: Option<
+            crate::crypto::vodozemac::olm::Account,
+        >,
+    ) -> Result<()> {
         debug!(user_id = ?session_meta.user_id, device_id = ?session_meta.device_id, "Restoring login");
         self.store.set_session_meta(session_meta.clone(), &self.roominfo_update_sender).await?;
 
         #[cfg(feature = "e2e-encryption")]
-        self.regenerate_olm().await?;
+        self.regenerate_olm(custom_account).await?;
 
         Ok(())
     }
@@ -215,15 +237,21 @@ impl BaseClient {
     ///
     /// In particular, this will clear all its caches.
     #[cfg(feature = "e2e-encryption")]
-    pub async fn regenerate_olm(&self) -> Result<()> {
+    pub async fn regenerate_olm(
+        &self,
+        custom_account: Option<crate::crypto::vodozemac::olm::Account>,
+    ) -> Result<()> {
         tracing::debug!("regenerating OlmMachine");
         let session_meta = self.session_meta().ok_or(Error::OlmError(OlmError::MissingSession))?;
 
-        // Recreate it.
+        // Recreate the `OlmMachine` and wipe the in-memory cache in the store
+        // because we suspect it has stale data.
+        self.crypto_store.clear_caches().await;
         let olm_machine = OlmMachine::with_store(
             &session_meta.user_id,
             &session_meta.device_id,
             self.crypto_store.clone(),
+            custom_account,
         )
         .await
         .map_err(OlmError::from)?;
@@ -327,17 +355,11 @@ impl BaseClient {
                                         }
                                     }
 
-                                    // Senders can fake the profile easily so we keep track
-                                    // of profiles that the member set themselves to avoid
-                                    // having confusing profile changes when a member gets
-                                    // kicked/banned.
-                                    if member.state_key() == member.sender() {
-                                        changes
-                                            .profiles
-                                            .entry(room.room_id().to_owned())
-                                            .or_default()
-                                            .insert(member.sender().to_owned(), member.into());
-                                    }
+                                    handle_room_member_event_for_profiles(
+                                        room.room_id(),
+                                        member,
+                                        changes,
+                                    );
                                 }
                                 _ => {
                                     room_info.handle_state_event(s);
@@ -401,7 +423,6 @@ impl BaseClient {
                             room_info,
                             changes,
                         )
-                        .await;
                     } else {
                         push_context = self.get_push_room_context(room, room_info, changes).await?;
                     }
@@ -423,7 +444,7 @@ impl BaseClient {
                     }
                 }
                 Err(e) => {
-                    warn!("Error deserializing event {e:?}");
+                    warn!("Error deserializing event: {e}");
                 }
             }
 
@@ -501,7 +522,6 @@ impl BaseClient {
     ) -> StoreResult<BTreeSet<OwnedUserId>> {
         let mut state_events = BTreeMap::new();
         let mut user_ids = BTreeSet::new();
-        let mut profiles = BTreeMap::new();
 
         assert_eq!(raw_events.len(), events.len());
 
@@ -518,13 +538,7 @@ impl BaseClient {
                     _ => (),
                 }
 
-                // Senders can fake the profile easily so we keep track
-                // of profiles that the member set themselves to avoid
-                // having confusing profile changes when a member gets
-                // kicked/banned.
-                if member.state_key() == member.sender() {
-                    profiles.insert(member.sender().to_owned(), member.into());
-                }
+                handle_room_member_event_for_profiles(&room_info.room_id, member, changes);
             }
 
             state_events
@@ -533,7 +547,6 @@ impl BaseClient {
                 .insert(event.state_key().to_owned(), raw_event.clone());
         }
 
-        changes.profiles.insert((*room_info.room_id).to_owned(), profiles);
         changes.state.insert((*room_info.room_id).to_owned(), state_events);
 
         Ok(user_ids)
@@ -564,7 +577,7 @@ impl BaseClient {
                 on_room_info(room_info);
             }
             // The `BaseClient` has the `Room`, which has the `RoomInfo`.
-            else if let Some(room) = client.store.get_room(room_id) {
+            else if let Some(room) = client.store.room(room_id) {
                 // Clone the `RoomInfo`.
                 let mut room_info = room.clone_info();
 
@@ -629,7 +642,7 @@ impl BaseClient {
 
                         if let Some(room) = changes.room_infos.get_mut(room_id) {
                             room.base_info.dm_targets.insert(user_id.clone());
-                        } else if let Some(room) = self.store.get_room(room_id) {
+                        } else if let Some(room) = self.store.room(room_id) {
                             let mut info = room.clone_info();
                             if info.base_info.dm_targets.insert(user_id.clone()) {
                                 changes.add_room(info);
@@ -721,7 +734,8 @@ impl BaseClient {
                     match is_suitable_for_latest_event(&any_sync_event) {
                         PossibleLatestEvent::YesRoomMessage(_)
                         | PossibleLatestEvent::YesPoll(_)
-                        | PossibleLatestEvent::YesCallInvite(_) => {
+                        | PossibleLatestEvent::YesCallInvite(_)
+                        | PossibleLatestEvent::YesCallNotify(_) => {
                             // The event is the right type for us to use as latest_event
                             return Some((Box::new(LatestEvent::new(decrypted)), i));
                         }
@@ -742,6 +756,7 @@ impl BaseClient {
             RoomState::Joined,
             self.roominfo_update_sender.clone(),
         );
+
         if room.state() != RoomState::Joined {
             let _sync_lock = self.sync_lock().lock().await;
 
@@ -768,6 +783,7 @@ impl BaseClient {
             RoomState::Left,
             self.roominfo_update_sender.clone(),
         );
+
         if room.state() != RoomState::Left {
             let _sync_lock = self.sync_lock().lock().await;
 
@@ -843,10 +859,11 @@ impl BaseClient {
                 RoomState::Joined,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
 
             room_info.mark_as_joined();
-            room_info.update_summary(&new_info.summary);
+            room_info.update_from_ruma_summary(&new_info.summary);
             room_info.set_prev_batch(new_info.timeline.prev_batch.as_deref());
             room_info.mark_state_fully_synced();
 
@@ -955,6 +972,7 @@ impl BaseClient {
                 RoomState::Left,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
             room_info.mark_as_left();
             room_info.mark_state_partially_synced();
@@ -1013,6 +1031,7 @@ impl BaseClient {
                 RoomState::Invited,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
             room_info.mark_as_invited();
             room_info.mark_state_fully_synced();
@@ -1057,6 +1076,13 @@ impl BaseClient {
             self.apply_changes(&changes, false);
         }
 
+        // Now that all the rooms information have been saved, update the display name
+        // cache (which relies on information stored in the database). This will
+        // live in memory, until the next sync which will saves the room info to
+        // disk; we do this to avoid saving that would be redundant with the
+        // above. Oh well.
+        new_rooms.update_in_memory_caches(&self.store).await;
+
         info!("Processed a sync response in {:?}", now.elapsed());
 
         let response = SyncResponse {
@@ -1090,8 +1116,8 @@ impl BaseClient {
         }
 
         for (room_id, room_info) in &changes.room_infos {
-            if let Some(room) = self.store.get_room(room_id) {
-                room.set_room_info(room_info.clone(), trigger_room_list_update);
+            if let Some(room) = self.store.room(room_id) {
+                room.set_room_info(room_info.clone(), trigger_room_list_update)
             }
         }
     }
@@ -1122,13 +1148,12 @@ impl BaseClient {
             return Err(Error::InvalidReceiveMembersParameters);
         }
 
-        let mut chunk = Vec::with_capacity(response.chunk.len());
-
-        let Some(room) = self.store.get_room(room_id) else {
+        let Some(room) = self.store.room(room_id) else {
             // The room is unknown to us: leave early.
             return Ok(());
         };
 
+        let mut chunk = Vec::with_capacity(response.chunk.len());
         let mut changes = StateChanges::default();
 
         #[cfg(feature = "e2e-encryption")]
@@ -1170,14 +1195,7 @@ impl BaseClient {
             }
 
             let sync_member: SyncRoomMemberEvent = member.clone().into();
-
-            if member.state_key() == member.sender() {
-                changes
-                    .profiles
-                    .entry(room_id.to_owned())
-                    .or_default()
-                    .insert(member.sender().to_owned(), sync_member.into());
-            }
+            handle_room_member_event_for_profiles(room_id, &sync_member, &mut changes);
 
             changes
                 .state
@@ -1218,11 +1236,10 @@ impl BaseClient {
     /// # Arguments
     ///
     /// * `filter_name` - The name that should be used to persist the filter id
-    ///   in
-    /// the store.
+    ///   in the store.
     ///
     /// * `response` - The successful filter upload response containing the
-    /// filter id.
+    ///   filter id.
     ///
     /// [`get_filter`]: #method.get_filter
     pub async fn receive_filter_upload(
@@ -1247,7 +1264,7 @@ impl BaseClient {
     /// # Arguments
     ///
     /// * `filter_name` - The name of the filter that was previously used to
-    /// persist the filter.
+    ///   persist the filter.
     ///
     /// [`receive_filter_upload`]: #method.receive_filter_upload
     pub async fn get_filter(&self, filter_name: &str) -> StoreResult<Option<String>> {
@@ -1295,7 +1312,7 @@ impl BaseClient {
     ///
     /// * `room_id` - The id of the room that should be fetched.
     pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
-        self.store.get_room(room_id)
+        self.store.room(room_id)
     }
 
     /// Get the olm machine.
@@ -1406,7 +1423,7 @@ impl BaseClient {
     /// Update the push context for the given room.
     ///
     /// Updates the context data from `changes` or `room_info`.
-    pub async fn update_push_room_context(
+    pub fn update_push_room_context(
         &self,
         push_rules: &mut PushConditionRoomCtx,
         user_id: &UserId,
@@ -1475,17 +1492,50 @@ impl Default for BaseClient {
     }
 }
 
+fn handle_room_member_event_for_profiles(
+    room_id: &RoomId,
+    event: &SyncStateEvent<RoomMemberEventContent>,
+    changes: &mut StateChanges,
+) {
+    // Senders can fake the profile easily so we keep track of profiles that the
+    // member set themselves to avoid having confusing profile changes when a
+    // member gets kicked/banned.
+    if event.state_key() == event.sender() {
+        changes
+            .profiles
+            .entry(room_id.to_owned())
+            .or_default()
+            .insert(event.sender().to_owned(), event.into());
+    }
+
+    if *event.membership() == MembershipState::Invite {
+        // Remove any profile previously stored for the invited user.
+        //
+        // A room member could have joined the room and left it later; in that case, the
+        // server may return a dummy, empty profile along the `leave` event. We
+        // don't want to reuse that empty profile when the member has been
+        // re-invited, so we remove it from the database.
+        changes
+            .profiles_to_delete
+            .entry(room_id.to_owned())
+            .or_default()
+            .push(event.state_key().clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
         async_test, response_from_file, sync_timeline_event, InvitedRoomBuilder, LeftRoomBuilder,
-        StrippedStateTestEvent, SyncResponseBuilder,
+        StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
     };
     use ruma::{
         api::{client as api, IncomingResponse},
-        room_id, user_id, UserId,
+        room_id,
+        serde::Raw,
+        user_id, UserId,
     };
-    use serde_json::json;
+    use serde_json::{json, value::to_raw_value};
 
     use super::BaseClient;
     use crate::{
@@ -1500,9 +1550,9 @@ mod tests {
 
         let client = logged_in_base_client(Some(user_id)).await;
 
-        let mut ev_builder = SyncResponseBuilder::new();
+        let mut sync_builder = SyncResponseBuilder::new();
 
-        let response = ev_builder
+        let response = sync_builder
             .add_left_room(LeftRoomBuilder::new(room_id).add_timeline_event(sync_timeline_event!({
                 "content": {
                     "displayname": "Alice",
@@ -1518,7 +1568,7 @@ mod tests {
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
 
-        let response = ev_builder
+        let response = sync_builder
             .add_invited_room(InvitedRoomBuilder::new(room_id).add_state_event(
                 StrippedStateTestEvent::Custom(json!({
                     "content": {
@@ -1620,7 +1670,7 @@ mod tests {
         let room = client.get_room(room_id).expect("Room not found");
         assert_eq!(room.state(), RoomState::Invited);
         assert_eq!(
-            room.display_name().await.expect("fetching display name failed"),
+            room.compute_display_name().await.expect("fetching display name failed"),
             DisplayName::Calculated("Kyra".to_owned())
         );
     }
@@ -1628,6 +1678,8 @@ mod tests {
     #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
     #[async_test]
     async fn test_when_there_are_no_latest_encrypted_events_decrypting_them_does_nothing() {
+        use crate::StateChanges;
+
         // Given a room
         let user_id = user_id!("@u:u.to");
         let room_id = room_id!("!r:u.to");
@@ -1639,7 +1691,7 @@ mod tests {
         assert!(room.latest_event().is_none());
 
         // When I tell it to do some decryption
-        let mut changes = crate::StateChanges::default();
+        let mut changes = StateChanges::default();
         client.decrypt_latest_events(&room, &mut changes).await;
 
         // Then nothing changed
@@ -1660,8 +1712,8 @@ mod tests {
         event_id: &str,
         user_id: &UserId,
     ) -> crate::Room {
-        let mut ev_builder = SyncResponseBuilder::new();
-        let response = ev_builder
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
                 sync_timeline_event!({
                     "content": {
@@ -1689,10 +1741,11 @@ mod tests {
 
         let client = BaseClient::new();
         client
-            .set_session_meta(SessionMeta {
-                user_id: user_id.to_owned(),
-                device_id: "FOOBAR".into(),
-            })
+            .set_session_meta(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
             .await
             .unwrap();
 
@@ -1739,5 +1792,138 @@ mod tests {
             .expect("State event not found")
             .deserialize()
             .expect("Failed to deserialize state event");
+    }
+
+    #[async_test]
+    async fn test_invited_members_arent_ignored() {
+        let user_id = user_id!("@alice:example.org");
+        let inviter_user_id = user_id!("@bob:example.org");
+        let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
+
+        let client = BaseClient::new();
+        client
+            .set_session_meta(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Preamble: let the SDK know about the room.
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        // When I process the result of a /members request that only contains an invited
+        // member,
+        let request = api::membership::get_member_events::v3::Request::new(room_id.to_owned());
+
+        let raw_member_event = json!({
+            "content": {
+                "avatar_url": "mxc://localhost/fewjilfewjil42",
+                "displayname": "Invited Alice",
+                "membership": "invite"
+            },
+            "event_id": "$151800140517rfvjc:localhost",
+            "origin_server_ts": 151800140,
+            "room_id": room_id,
+            "sender": inviter_user_id,
+            "state_key": user_id,
+            "type": "m.room.member",
+            "unsigned": {
+                "age": 13374242,
+            }
+        });
+        let response = api::membership::get_member_events::v3::Response::new(vec![Raw::from_json(
+            to_raw_value(&raw_member_event).unwrap(),
+        )]);
+
+        // It's correctly processed,
+        client.receive_all_members(room_id, &request, &response).await.unwrap();
+
+        let room = client.get_room(room_id).unwrap();
+
+        // And I can get the invited member display name and avatar.
+        let member = room.get_member(user_id).await.expect("ok").expect("exists");
+
+        assert_eq!(member.user_id(), user_id);
+        assert_eq!(member.display_name().unwrap(), "Invited Alice");
+        assert_eq!(member.avatar_url().unwrap().to_string(), "mxc://localhost/fewjilfewjil42");
+    }
+
+    #[async_test]
+    async fn test_reinvited_members_get_a_display_name() {
+        let user_id = user_id!("@alice:example.org");
+        let inviter_user_id = user_id!("@bob:example.org");
+        let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
+
+        let client = BaseClient::new();
+        client
+            .set_session_meta(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Preamble: let the SDK know about the room, and that the invited user left it.
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_state_event(
+                StateTestEvent::Custom(json!({
+                    "content": {
+                        "avatar_url": null,
+                        "displayname": null,
+                        "membership": "leave"
+                    },
+                    "event_id": "$151803140217rkvjc:localhost",
+                    "origin_server_ts": 151800139,
+                    "room_id": room_id,
+                    "sender": user_id,
+                    "state_key": user_id,
+                    "type": "m.room.member",
+                })),
+            ))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        // Now, say that the user has been re-invited.
+        let request = api::membership::get_member_events::v3::Request::new(room_id.to_owned());
+
+        let raw_member_event = json!({
+            "content": {
+                "avatar_url": "mxc://localhost/fewjilfewjil42",
+                "displayname": "Invited Alice",
+                "membership": "invite"
+            },
+            "event_id": "$151800140517rfvjc:localhost",
+            "origin_server_ts": 151800140,
+            "room_id": room_id,
+            "sender": inviter_user_id,
+            "state_key": user_id,
+            "type": "m.room.member",
+            "unsigned": {
+                "age": 13374242,
+            }
+        });
+        let response = api::membership::get_member_events::v3::Response::new(vec![Raw::from_json(
+            to_raw_value(&raw_member_event).unwrap(),
+        )]);
+
+        // It's correctly processed,
+        client.receive_all_members(room_id, &request, &response).await.unwrap();
+
+        let room = client.get_room(room_id).unwrap();
+
+        // And I can get the invited member display name and avatar.
+        let member = room.get_member(user_id).await.expect("ok").expect("exists");
+
+        assert_eq!(member.user_id(), user_id);
+        assert_eq!(member.display_name().unwrap(), "Invited Alice");
+        assert_eq!(member.avatar_url().unwrap().to_string(), "mxc://localhost/fewjilfewjil42");
     }
 }

@@ -23,16 +23,16 @@ pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
     store::{DynStateStore, MemoryStore, StateStoreExt},
-    DisplayName, Room as BaseRoom, RoomCreateWithCreatorEventContent, RoomInfo,
-    RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
-    StateStore, StoreError,
+    ComposerDraft, ComposerDraftType, DisplayName, Room as BaseRoom,
+    RoomCreateWithCreatorEventContent, RoomHero, RoomInfo, RoomMember as BaseRoomMember,
+    RoomMemberships, RoomState, SessionMeta, StateChanges, StateStore, StoreError,
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
 
 mod account;
 pub mod attachment;
-mod authentication;
+pub mod authentication;
 mod client;
 pub mod config;
 mod deduplicating_handler;
@@ -47,8 +47,11 @@ pub mod media;
 pub mod notification_settings;
 #[cfg(feature = "experimental-oidc")]
 pub mod oidc;
+pub mod pusher;
 pub mod room;
 pub mod room_directory_search;
+pub mod room_preview;
+pub mod send_queue;
 pub mod utils;
 pub mod futures {
     //! Named futures returned from methods on types in [the crate root][crate].
@@ -78,6 +81,7 @@ pub use matrix_sdk_sqlite::SqliteCryptoStore;
 #[cfg(feature = "sqlite")]
 pub use matrix_sdk_sqlite::SqliteStateStore;
 pub use media::Media;
+pub use pusher::Pusher;
 pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
 #[cfg(feature = "experimental-sliding-sync")]

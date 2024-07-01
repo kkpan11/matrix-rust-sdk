@@ -1,12 +1,10 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use assert_matches2::assert_let;
+use eyeball_im::VectorDiff;
 use futures_util::FutureExt;
 use matrix_sdk::{
-    config::SyncSettings,
-    media::{MediaFormat, MediaRequest, MediaThumbnailSize},
-    sync::RoomUpdate,
-    test_utils::no_retry_test_client_with_server,
+    config::SyncSettings, sync::RoomUpdate, test_utils::no_retry_test_client_with_server,
 };
 use matrix_sdk_base::{sync::RoomUpdates, RoomState};
 use matrix_sdk_test::{
@@ -23,20 +21,15 @@ use ruma::{
             get_public_rooms,
             get_public_rooms_filtered::{self, v3::Request as PublicRoomsFilterRequest},
         },
-        media::get_content_thumbnail::v3::Method,
         uiaa,
     },
     assign, device_id,
     directory::Filter,
     event_id,
-    events::{
-        direct::DirectEventContent,
-        room::{message::ImageMessageEventContent, ImageInfo, MediaSource},
-        AnyInitialStateEvent,
-    },
-    mxc_uri, room_id,
+    events::{direct::DirectEventContent, AnyInitialStateEvent},
+    room_id,
     serde::Raw,
-    uint, user_id, OwnedUserId,
+    user_id, OwnedUserId,
 };
 use serde_json::{json, Value as JsonValue};
 use stream_assert::{assert_next_matches, assert_pending};
@@ -49,7 +42,7 @@ use wiremock::{
 use crate::{logged_in_client_with_server, mock_sync};
 
 #[async_test]
-async fn sync() {
+async fn test_sync() {
     let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
@@ -62,7 +55,7 @@ async fn sync() {
 }
 
 #[async_test]
-async fn devices() {
+async fn test_devices() {
     let (client, server) = logged_in_client_with_server().await;
 
     Mock::given(method("GET"))
@@ -75,7 +68,7 @@ async fn devices() {
 }
 
 #[async_test]
-async fn delete_devices() {
+async fn test_delete_devices() {
     let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("POST"))
@@ -141,7 +134,7 @@ async fn delete_devices() {
 }
 
 #[async_test]
-async fn resolve_room_alias() {
+async fn test_resolve_room_alias() {
     let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("GET"))
@@ -155,7 +148,7 @@ async fn resolve_room_alias() {
 }
 
 #[async_test]
-async fn join_leave_room() {
+async fn test_join_leave_room() {
     let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
@@ -178,7 +171,7 @@ async fn join_leave_room() {
 }
 
 #[async_test]
-async fn join_room_by_id() {
+async fn test_join_room_by_id() {
     let (client, server) = logged_in_client_with_server().await;
 
     Mock::given(method("POST"))
@@ -197,7 +190,7 @@ async fn join_room_by_id() {
 }
 
 #[async_test]
-async fn join_room_by_id_or_alias() {
+async fn test_join_room_by_id_or_alias() {
     let (client, server) = logged_in_client_with_server().await;
 
     Mock::given(method("POST"))
@@ -223,7 +216,7 @@ async fn join_room_by_id_or_alias() {
 }
 
 #[async_test]
-async fn room_search_all() {
+async fn test_room_search_all() {
     let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("GET"))
@@ -238,7 +231,7 @@ async fn room_search_all() {
 }
 
 #[async_test]
-async fn room_search_filtered() {
+async fn test_room_search_filtered() {
     let (client, server) = logged_in_client_with_server().await;
 
     Mock::given(method("POST"))
@@ -258,7 +251,7 @@ async fn room_search_filtered() {
 }
 
 #[async_test]
-async fn invited_rooms() {
+async fn test_invited_rooms() {
     let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::INVITE_SYNC, None).await;
@@ -274,7 +267,7 @@ async fn invited_rooms() {
 }
 
 #[async_test]
-async fn left_rooms() {
+async fn test_left_rooms() {
     let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::LEAVE_SYNC, None).await;
@@ -290,120 +283,7 @@ async fn left_rooms() {
 }
 
 #[async_test]
-async fn get_media_content() {
-    let (client, server) = logged_in_client_with_server().await;
-
-    let media = client.media();
-
-    let request = MediaRequest {
-        source: MediaSource::Plain(mxc_uri!("mxc://localhost/textfile").to_owned()),
-        format: MediaFormat::File,
-    };
-
-    // First time, without the cache.
-    {
-        let expected_content = "Hello, World!";
-        let _mock_guard = Mock::given(method("GET"))
-            .and(path("/_matrix/media/r0/download/localhost/textfile"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(expected_content))
-            .mount_as_scoped(&server)
-            .await;
-
-        assert_eq!(
-            media.get_media_content(&request, false).await.unwrap(),
-            expected_content.as_bytes()
-        );
-    }
-
-    // Second time, without the cache, error from the HTTP server.
-    {
-        let _mock_guard = Mock::given(method("GET"))
-            .and(path("/_matrix/media/r0/download/localhost/textfile"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount_as_scoped(&server)
-            .await;
-
-        assert!(media.get_media_content(&request, false).await.is_err());
-    }
-
-    let expected_content = "Hello, World (2)!";
-
-    // Third time, with the cache.
-    {
-        let _mock_guard = Mock::given(method("GET"))
-            .and(path("/_matrix/media/r0/download/localhost/textfile"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(expected_content))
-            .mount_as_scoped(&server)
-            .await;
-
-        assert_eq!(
-            media.get_media_content(&request, true).await.unwrap(),
-            expected_content.as_bytes()
-        );
-    }
-
-    // Third time, with the cache, the HTTP server isn't reached.
-    {
-        let _mock_guard = Mock::given(method("GET"))
-            .and(path("/_matrix/media/r0/download/localhost/textfile"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount_as_scoped(&server)
-            .await;
-
-        assert_eq!(
-            client.media().get_media_content(&request, true).await.unwrap(),
-            expected_content.as_bytes()
-        );
-    }
-}
-
-#[async_test]
-async fn get_media_file() {
-    let (client, server) = logged_in_client_with_server().await;
-
-    let event_content = ImageMessageEventContent::plain(
-        "filename.jpg".into(),
-        mxc_uri!("mxc://example.org/image").to_owned(),
-    )
-    .info(Box::new(assign!(ImageInfo::new(), {
-        height: Some(uint!(398)),
-        width: Some(uint!(394)),
-        mimetype: Some("image/jpeg".into()),
-        size: Some(uint!(31037)),
-    })));
-
-    Mock::given(method("GET"))
-        .and(path("/_matrix/media/r0/download/example.org/image"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw("binaryjpegdata", "image/jpeg"))
-        .named("get_file")
-        .mount(&server)
-        .await;
-
-    client.media().get_file(&event_content, false).await.unwrap();
-
-    Mock::given(method("GET"))
-        .and(path("/_matrix/media/r0/thumbnail/example.org/image"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw("smallerbinaryjpegdata", "image/jpeg"),
-        )
-        .expect(1)
-        .named("get_thumbnail")
-        .mount(&server)
-        .await;
-
-    client
-        .media()
-        .get_thumbnail(
-            &event_content,
-            MediaThumbnailSize { method: Method::Scale, width: uint!(100), height: uint!(100) },
-            false,
-        )
-        .await
-        .unwrap();
-}
-
-#[async_test]
-async fn whoami() {
+async fn test_whoami() {
     let (client, server) = logged_in_client_with_server().await;
 
     Mock::given(method("GET"))
@@ -504,7 +384,7 @@ async fn test_subscribe_all_room_updates() {
 // the same result.
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 #[async_test]
-async fn request_encryption_event_before_sending() {
+async fn test_request_encryption_event_before_sending() {
     let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
@@ -555,7 +435,7 @@ async fn request_encryption_event_before_sending() {
 // Check that we're fetching account data from the server when marking a room as
 // a DM.
 #[async_test]
-async fn marking_room_as_dm() {
+async fn test_marking_room_as_dm() {
     let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
@@ -626,7 +506,7 @@ async fn marking_room_as_dm() {
 
 #[cfg(feature = "e2e-encryption")]
 #[async_test]
-async fn get_own_device() {
+async fn test_get_own_device() {
     let (client, _) = logged_in_client_with_server().await;
 
     let device = client
@@ -649,7 +529,7 @@ async fn get_own_device() {
 
 #[cfg(feature = "e2e-encryption")]
 #[async_test]
-async fn cross_signing_status() {
+async fn test_cross_signing_status() {
     let (client, server) = logged_in_client_with_server().await;
 
     Mock::given(method("POST"))
@@ -806,7 +686,7 @@ async fn test_encrypt_room_event() {
         .take()
         .expect("We should have intercepted an `m.room.encrypted` event content");
 
-    let event = ruma::serde::Raw::new(&json!({
+    let event = Raw::new(&json!({
         "room_id": room.room_id(),
         "event_id": "$foobar",
         "origin_server_ts": 1600000u64,
@@ -844,7 +724,7 @@ async fn test_encrypt_room_event() {
 
 #[cfg(not(feature = "e2e-encryption"))]
 #[async_test]
-async fn create_dm_non_encrypted() {
+async fn test_create_dm_non_encrypted() {
     let (client, server) = logged_in_client_with_server().await;
     let user_id = user_id!("@invitee:localhost");
 
@@ -893,7 +773,7 @@ async fn create_dm_non_encrypted() {
 
 #[cfg(feature = "e2e-encryption")]
 #[async_test]
-async fn create_dm_encrypted() {
+async fn test_create_dm_encrypted() {
     let (client, server) = logged_in_client_with_server().await;
     let user_id = user_id!("@invitee:localhost");
 
@@ -955,7 +835,7 @@ async fn create_dm_encrypted() {
 }
 
 #[async_test]
-async fn create_dm_error() {
+async fn test_create_dm_error() {
     let (client, _server) = logged_in_client_with_server().await;
     let user_id = user_id!("@invitee:localhost");
 
@@ -967,7 +847,7 @@ async fn create_dm_error() {
 }
 
 #[async_test]
-async fn test_ambiguity_changes() {
+async fn test_test_ambiguity_changes() {
     let (client, server) = logged_in_client_with_server().await;
 
     let example_id = user_id!("@example:localhost");
@@ -1259,4 +1139,60 @@ async fn test_ambiguity_changes() {
     assert!(changes.is_empty());
 
     assert_pending!(updates);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_test]
+async fn test_rooms_stream() {
+    use futures_util::StreamExt as _;
+
+    let (client, server) = logged_in_client_with_server().await;
+    let (rooms, mut rooms_stream) = client.rooms_stream();
+
+    assert!(rooms.is_empty());
+    assert_pending!(rooms_stream);
+
+    let room_id_1 = room_id!("!room0:matrix.org");
+    let room_id_2 = room_id!("!room1:matrix.org");
+    let room_id_3 = room_id!("!room2:matrix.org");
+
+    let payload = json!({
+        "next_batch": "foo",
+        "rooms": {
+            "invite": {},
+            "join": {
+                room_id_1: {},
+                room_id_2: {},
+                room_id_3: {},
+            },
+            "leave": {}
+        },
+    });
+
+    mock_sync(&server, &payload, None).await;
+
+    assert!(client.get_room(room_id_1).is_none());
+    assert!(client.get_room(room_id_2).is_none());
+    assert!(client.get_room(room_id_3).is_none());
+
+    client.sync_once(SyncSettings::default()).await.unwrap();
+
+    // Rooms are created.
+    assert!(client.get_room(room_id_1).is_some());
+    assert!(client.get_room(room_id_2).is_some());
+    assert!(client.get_room(room_id_3).is_some());
+
+    // We receive 3 diffs…
+    assert_let!(Some(diffs) = rooms_stream.next().await);
+    assert_eq!(diffs.len(), 3);
+
+    // … which map to the new rooms!
+    assert_let!(VectorDiff::PushBack { value: room_1 } = &diffs[0]);
+    assert_eq!(room_1.room_id(), room_id_1);
+    assert_let!(VectorDiff::PushBack { value: room_2 } = &diffs[1]);
+    assert_eq!(room_2.room_id(), room_id_2);
+    assert_let!(VectorDiff::PushBack { value: room_3 } = &diffs[2]);
+    assert_eq!(room_3.room_id(), room_id_3);
+
+    assert_pending!(rooms_stream);
 }

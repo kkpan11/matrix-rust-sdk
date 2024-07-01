@@ -19,11 +19,17 @@ use std::{
     fmt::{self, Debug},
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
 };
 
 use eyeball::{SharedObservable, Subscriber};
+#[cfg(not(target_arch = "wasm32"))]
+use eyeball_im::VectorDiff;
 use futures_core::Stream;
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::StreamExt;
+#[cfg(not(target_arch = "wasm32"))]
+use imbl::Vector;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
@@ -48,7 +54,6 @@ use ruma::{
             },
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             membership::{join_room_by_id, join_room_by_id_or_alias},
-            push::{set_pusher, Pusher},
             room::create_room,
             session::login::v3::DiscoveryInfo,
             sync::sync_events,
@@ -83,8 +88,10 @@ use crate::{
     http_client::HttpClient,
     matrix_auth::MatrixAuth,
     notification_settings::NotificationSettings,
+    room_preview::RoomPreview,
+    send_queue::SendQueueData,
     sync::{RoomUpdate, SyncResponse},
-    Account, AuthApi, AuthSession, Error, Media, RefreshTokenError, Result, Room,
+    Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
     TransmissionProgress,
 };
 #[cfg(feature = "e2e-encryption")]
@@ -282,6 +289,11 @@ pub(crate) struct ClientInner {
     /// The verification state of our own device.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) verification_state: SharedObservable<VerificationState>,
+
+    /// Data related to the [`SendQueue`].
+    ///
+    /// [`SendQueue`]: crate::send_queue::SendQueue
+    pub(crate) send_queue_data: Arc<SendQueueData>,
 }
 
 impl ClientInner {
@@ -301,6 +313,7 @@ impl ClientInner {
         unstable_features: Option<BTreeMap<String, bool>>,
         respect_login_well_known: bool,
         event_cache: OnceCell<EventCache>,
+        send_queue: Arc<SendQueueData>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
     ) -> Arc<Self> {
         let client = Self {
@@ -323,6 +336,7 @@ impl ClientInner {
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             event_cache,
+            send_queue_data: send_queue,
             #[cfg(feature = "e2e-encryption")]
             e2ee: EncryptionData::new(encryption_settings),
             #[cfg(feature = "e2e-encryption")]
@@ -335,7 +349,10 @@ impl ClientInner {
         #[cfg(feature = "e2e-encryption")]
         client.e2ee.initialize_room_key_tasks(&client);
 
-        let _ = client.event_cache.get_or_init(|| async { EventCache::new(&client) }).await;
+        let _ = client
+            .event_cache
+            .get_or_init(|| async { EventCache::new(WeakClient::from_inner(&client)) })
+            .await;
 
         client
     }
@@ -375,6 +392,11 @@ impl Client {
 
     pub(crate) fn base_client(&self) -> &BaseClient {
         &self.inner.base_client
+    }
+
+    /// The underlying HTTP client.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.inner.http_client.inner
     }
 
     pub(crate) fn locks(&self) -> &ClientLocks {
@@ -559,6 +581,11 @@ impl Client {
     /// Get the media manager of the client.
     pub fn media(&self) -> Media {
         Media::new(self.clone())
+    }
+
+    /// Get the pusher manager of the client.
+    pub fn pusher(&self) -> Pusher {
+        Pusher::new(self.clone())
     }
 
     /// Access the OpenID Connect API of the client.
@@ -885,26 +912,35 @@ impl Client {
     ///
     /// This will return the list of joined, invited, and left rooms.
     pub fn rooms(&self) -> Vec<Room> {
-        self.base_client()
-            .get_rooms()
-            .into_iter()
-            .map(|room| Room::new(self.clone(), room))
-            .collect()
+        self.base_client().rooms().into_iter().map(|room| Room::new(self.clone(), room)).collect()
     }
 
     /// Get all the rooms the client knows about, filtered by room state.
     pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(filter)
+            .rooms_filtered(filter)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
     }
 
+    /// Get a stream of all the rooms, in addition to the existing rooms.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
+        let (rooms, stream) = self.base_client().rooms_stream();
+
+        let map_room = |room| Room::new(self.clone(), room);
+
+        (
+            rooms.into_iter().map(map_room).collect(),
+            stream.map(move |diffs| diffs.into_iter().map(|diff| diff.map(map_room)).collect()),
+        )
+    }
+
     /// Returns the joined rooms this client knows about.
     pub fn joined_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::JOINED)
+            .rooms_filtered(RoomStateFilter::JOINED)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -913,7 +949,7 @@ impl Client {
     /// Returns the invited rooms this client knows about.
     pub fn invited_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::INVITED)
+            .rooms_filtered(RoomStateFilter::INVITED)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -922,7 +958,7 @@ impl Client {
     /// Returns the left rooms this client knows about.
     pub fn left_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::LEFT)
+            .rooms_filtered(RoomStateFilter::LEFT)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -935,6 +971,25 @@ impl Client {
     /// `room_id` - The unique id of the room that should be fetched.
     pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
         self.base_client().get_room(room_id).map(|room| Room::new(self.clone(), room))
+    }
+
+    /// Gets the preview of a room, whether the current user knows it (because
+    /// they've joined/left/been invited to it) or not.
+    pub async fn get_room_preview(
+        &self,
+        room_or_alias_id: &RoomOrAliasId,
+        via: Vec<OwnedServerName>,
+    ) -> Result<RoomPreview> {
+        let room_id = match <&RoomId>::try_from(room_or_alias_id) {
+            Ok(room_id) => room_id.to_owned(),
+            Err(alias) => self.resolve_room_alias(alias).await?.room_id,
+        };
+
+        if let Some(room) = self.get_room(&room_id) {
+            return Ok(RoomPreview::from_known(&room));
+        }
+
+        RoomPreview::from_unknown(self, room_id, room_or_alias_id, via).await
     }
 
     /// Resolve a room alias to a room id and a list of servers which know
@@ -986,8 +1041,19 @@ impl Client {
         }
     }
 
-    pub(crate) async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
-        self.base_client().set_session_meta(session_meta).await?;
+    pub(crate) async fn set_session_meta(
+        &self,
+        session_meta: SessionMeta,
+        #[cfg(feature = "e2e-encryption")] custom_account: Option<vodozemac::olm::Account>,
+    ) -> Result<()> {
+        self.base_client()
+            .set_session_meta(
+                session_meta,
+                #[cfg(feature = "e2e-encryption")]
+                custom_account,
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -1104,8 +1170,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// * `alias` - The `RoomId` or `RoomAliasId` of the room to be joined.
-    /// An alias looks like `#name:example.com`.
+    /// * `alias` - The `RoomId` or `RoomAliasId` of the room to be joined. An
+    ///   alias looks like `#name:example.com`.
     pub async fn join_room_by_id_or_alias(
         &self,
         alias: &RoomOrAliasId,
@@ -1250,7 +1316,7 @@ impl Client {
     /// # Arguments
     ///
     /// * `room_search` - The easiest way to create this request is using the
-    /// `get_public_rooms_filtered::Request` itself.
+    ///   `get_public_rooms_filtered::Request` itself.
     ///
     /// # Examples
     ///
@@ -1296,7 +1362,7 @@ impl Client {
     /// * `request` - A filled out and valid request for the endpoint to be hit
     ///
     /// * `timeout` - An optional request timeout setting, this overrides the
-    /// default request setting if one was set.
+    ///   default request setting if one was set.
     ///
     /// # Examples
     ///
@@ -1504,13 +1570,13 @@ impl Client {
     /// # Arguments
     ///
     /// * `devices` - The list of devices that should be deleted from the
-    /// server.
+    ///   server.
     ///
     /// * `auth_data` - This request requires user interactive auth, the first
-    /// request needs to set this to `None` and will always fail with an
-    /// `UiaaResponse`. The response will contain information for the
-    /// interactive auth and the same request needs to be made but this time
-    /// with some `auth_data` provided.
+    ///   request needs to set this to `None` and will always fail with an
+    ///   `UiaaResponse`. The response will contain information for the
+    ///   interactive auth and the same request needs to be made but this time
+    ///   with some `auth_data` provided.
     ///
     /// ```no_run
     /// # use matrix_sdk::{
@@ -2041,12 +2107,6 @@ impl Client {
         Ok(())
     }
 
-    /// Sets a given pusher
-    pub async fn set_pusher(&self, pusher: Pusher) -> HttpResult<set_pusher::v3::Response> {
-        let request = set_pusher::v3::Request::post(pusher);
-        self.send(request, None).await
-    }
-
     /// Get the notification settings of the current owner of the client.
     pub async fn notification_settings(&self) -> NotificationSettings {
         let ruleset = self.account().push_rules().await.unwrap_or_else(|_| Ruleset::new());
@@ -2070,6 +2130,7 @@ impl Client {
                 self.inner.unstable_features.get().cloned(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
+                self.inner.send_queue_data.clone(),
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.e2ee.encryption_settings,
             )
@@ -2084,7 +2145,13 @@ impl Client {
         // overwrite the session information shared with the parent too, and it
         // must be initialized at most once.
         if let Some(session) = self.session() {
-            client.set_session_meta(session.into_meta()).await?;
+            client
+                .set_session_meta(
+                    session.into_meta(),
+                    #[cfg(feature = "e2e-encryption")]
+                    None,
+                )
+                .await?;
         }
 
         Ok(client)
@@ -2097,11 +2164,43 @@ impl Client {
     }
 }
 
+/// A weak reference to the inner client, useful when trying to get a handle
+/// on the owning client.
+#[derive(Clone)]
+pub(crate) struct WeakClient {
+    client: Weak<ClientInner>,
+}
+
+impl WeakClient {
+    /// Construct a [`WeakClient`] from a `Arc<ClientInner>`.
+    pub fn from_inner(client: &Arc<ClientInner>) -> Self {
+        Self { client: Arc::downgrade(client) }
+    }
+
+    /// Construct a [`WeakClient`] from a [`Client`].
+    pub fn from_client(client: &Client) -> Self {
+        Self::from_inner(&client.inner)
+    }
+
+    /// Attempts to get a [`Client`] from this [`WeakClient`].
+    pub fn get(&self) -> Option<Client> {
+        self.client.upgrade().map(|inner| Client { inner })
+    }
+
+    /// Gets the number of strong (`Arc`) pointers still pointing to this
+    /// client.
+    #[allow(dead_code)]
+    pub fn strong_count(&self) -> usize {
+        self.client.strong_count()
+    }
+}
+
 // The http mocking library is not supported for wasm32
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use assert_matches::assert_matches;
     use matrix_sdk_base::RoomState;
     use matrix_sdk_test::{
         async_test, test_json, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder,
@@ -2110,7 +2209,10 @@ pub(crate) mod tests {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-    use ruma::{events::ignored_user_list::IgnoredUserListEventContent, UserId};
+    use ruma::{
+        events::ignored_user_list::IgnoredUserListEventContent, owned_room_id, room_id, RoomId,
+        UserId,
+    };
     use url::Url;
     use wiremock::{
         matchers::{body_json, header, method, path},
@@ -2119,8 +2221,10 @@ pub(crate) mod tests {
 
     use super::Client;
     use crate::{
+        client::WeakClient,
         config::{RequestConfig, SyncSettings},
         test_utils::{logged_in_client, no_retry_test_client, test_client_builder},
+        Error,
     };
 
     #[async_test]
@@ -2365,5 +2469,109 @@ pub(crate) mod tests {
 
         let msc4028_enabled = client.can_homeserver_push_encrypted_event_to_device().await.unwrap();
         assert!(msc4028_enabled);
+    }
+
+    #[async_test]
+    async fn test_recently_visited_rooms() {
+        // Tracking recently visited rooms requires authentication
+        let client = no_retry_test_client(Some("http://localhost".to_owned())).await;
+        assert_matches!(
+            client.account().track_recently_visited_room(owned_room_id!("!alpha:localhost")).await,
+            Err(Error::AuthenticationRequired)
+        );
+
+        let client = logged_in_client(None).await;
+        let account = client.account();
+
+        // We should start off with an empty list
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 0);
+
+        // Tracking a valid room id should add it to the list
+        account.track_recently_visited_room(owned_room_id!("!alpha:localhost")).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
+
+        // And the existing list shouldn't be changed
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
+
+        // Tracking the same room again shouldn't change the list
+        account.track_recently_visited_room(owned_room_id!("!alpha:localhost")).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
+
+        // Tracking a second room should add it to the front of the list
+        account.track_recently_visited_room(owned_room_id!("!beta:localhost")).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 2);
+        assert_eq!(
+            account.get_recently_visited_rooms().await.unwrap(),
+            [room_id!("!beta:localhost"), room_id!("!alpha:localhost")]
+        );
+
+        // Tracking the first room yet again should move it to the front of the list
+        account.track_recently_visited_room(owned_room_id!("!alpha:localhost")).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 2);
+        assert_eq!(
+            account.get_recently_visited_rooms().await.unwrap(),
+            [room_id!("!alpha:localhost"), room_id!("!beta:localhost")]
+        );
+
+        // Tracking should be capped at 20
+        for n in 0..20 {
+            account
+                .track_recently_visited_room(RoomId::parse(format!("!{n}:localhost")).unwrap())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 20);
+
+        // And the initial rooms should've been pushed out
+        let rooms = account.get_recently_visited_rooms().await.unwrap();
+        assert!(!rooms.contains(&owned_room_id!("!alpha:localhost")));
+        assert!(!rooms.contains(&owned_room_id!("!beta:localhost")));
+
+        // And the last tracked room should be the first
+        assert_eq!(rooms.first().unwrap(), room_id!("!19:localhost"));
+    }
+
+    #[async_test]
+    async fn test_client_no_cycle_with_event_cache() {
+        let client = logged_in_client(None).await;
+
+        // Wait for the init tasks to die.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let weak_client = WeakClient::from_client(&client);
+        assert_eq!(weak_client.strong_count(), 1);
+
+        {
+            let room_id = room_id!("!room:example.org");
+
+            // Have the client know the room.
+            let response = SyncResponseBuilder::default()
+                .add_joined_room(JoinedRoomBuilder::new(room_id))
+                .build_sync_response();
+            client.inner.base_client.receive_sync_response(response).await.unwrap();
+
+            client.event_cache().subscribe().unwrap();
+
+            let (_room_event_cache, _drop_handles) =
+                client.get_room(room_id).unwrap().event_cache().await.unwrap();
+        }
+
+        drop(client);
+
+        // Give a bit of time for background tasks to die.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The weak client must be the last reference to the client now.
+        assert_eq!(weak_client.strong_count(), 0);
+        let client = weak_client.get();
+        assert!(
+            client.is_none(),
+            "too many strong references to the client: {}",
+            Arc::strong_count(&client.unwrap().inner)
+        );
     }
 }

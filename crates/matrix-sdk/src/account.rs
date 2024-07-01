@@ -44,12 +44,12 @@ use ruma::{
     push::Ruleset,
     serde::Raw,
     thirdparty::Medium,
-    ClientSecret, MxcUri, OwnedMxcUri, OwnedUserId, RoomId, SessionId, UInt, UserId,
+    ClientSecret, MxcUri, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, SessionId, UInt, UserId,
 };
 use serde::Deserialize;
 use tracing::error;
 
-use crate::{config::RequestConfig, Client, Error, HttpError, Result};
+use crate::{config::RequestConfig, Client, Error, Result};
 
 /// A high-level API to manage the client owner's account.
 ///
@@ -61,6 +61,10 @@ pub struct Account {
 }
 
 impl Account {
+    /// The maximum number of visited room identifiers to keep in the state
+    /// store.
+    const VISITED_ROOMS_LIMIT: usize = 20;
+
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
     }
@@ -117,6 +121,10 @@ impl Account {
 
     /// Get the MXC URI of the account's avatar, if set.
     ///
+    /// This always sends a request to the server to retrieve this information.
+    /// If successful, this fills the cache, and makes it so that
+    /// [`Self::get_cached_avatar_url`] will always return something.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -147,7 +155,7 @@ impl Account {
                 .store()
                 .set_kv_data(
                     StateStoreDataKey::UserAvatarUrl(user_id),
-                    StateStoreDataValue::UserAvatarUrl(url.to_string()),
+                    StateStoreDataValue::UserAvatarUrl(url),
                 )
                 .await;
         } else {
@@ -159,7 +167,7 @@ impl Account {
     }
 
     /// Get the URL of the account's avatar, if is stored in cache.
-    pub async fn get_cached_avatar_url(&self) -> Result<Option<String>> {
+    pub async fn get_cached_avatar_url(&self) -> Result<Option<OwnedMxcUri>> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let data =
             self.client.store().get_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await?;
@@ -293,10 +301,10 @@ impl Account {
     /// * `new_password` - The new password to set.
     ///
     /// * `auth_data` - This request uses the [User-Interactive Authentication
-    /// API][uiaa]. The first request needs to set this to `None` and will
-    /// always fail with an [`UiaaResponse`]. The response will contain
-    /// information for the interactive auth and the same request needs to be
-    /// made but this time with some `auth_data` provided.
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail with an [`UiaaResponse`]. The response will contain
+    ///   information for the interactive auth and the same request needs to be
+    ///   made but this time with some `auth_data` provided.
     ///
     /// # Returns
     ///
@@ -344,13 +352,13 @@ impl Account {
     /// # Arguments
     ///
     /// * `id_server` - The identity server from which to unbind the user’s
-    /// [Third Party Identifiers][3pid].
+    ///   [Third Party Identifiers][3pid].
     ///
     /// * `auth_data` - This request uses the [User-Interactive Authentication
-    /// API][uiaa]. The first request needs to set this to `None` and will
-    /// always fail with an [`UiaaResponse`]. The response will contain
-    /// information for the interactive auth and the same request needs to be
-    /// made but this time with some `auth_data` provided.
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail with an [`UiaaResponse`]. The response will contain
+    ///   information for the interactive auth and the same request needs to be
+    ///   made but this time with some `auth_data` provided.
     ///
     /// # Examples
     ///
@@ -428,22 +436,21 @@ impl Account {
     /// # Arguments
     ///
     /// * `client_secret` - A client-generated secret string used to protect
-    /// this session.
+    ///   this session.
     ///
     /// * `email` - The email address to validate.
     ///
     /// * `send_attempt` - The attempt number. This number needs to be
-    /// incremented if you want to request another token for the same
-    /// validation.
+    ///   incremented if you want to request another token for the same
+    ///   validation.
     ///
     /// # Returns
     ///
-    /// * `sid` - The session ID to be used in following requests for
-    /// this 3PID.
+    /// * `sid` - The session ID to be used in following requests for this 3PID.
     ///
-    /// * `submit_url` - If present, the user will submit the token to
-    /// the client, that must send it to this URL. If not, the client will not
-    /// be involved in the token submission.
+    /// * `submit_url` - If present, the user will submit the token to the
+    ///   client, that must send it to this URL. If not, the client will not be
+    ///   involved in the token submission.
     ///
     /// This method might return an [`ErrorKind::ThreepidInUse`] error if the
     /// email address is already registered for this account or another, or an
@@ -500,25 +507,25 @@ impl Account {
     /// # Arguments
     ///
     /// * `client_secret` - A client-generated secret string used to protect
-    /// this session.
+    ///   this session.
     ///
     /// * `country` - The two-letter uppercase ISO-3166-1 alpha-2 country code
-    /// that the number in phone_number should be parsed as if it were dialled
-    /// from.
+    ///   that the number in phone_number should be parsed as if it were dialled
+    ///   from.
     ///
     /// * `phone_number` - The phone number to validate.
     ///
     /// * `send_attempt` - The attempt number. This number needs to be
-    /// incremented if you want to request another token for the same
-    /// validation.
+    ///   incremented if you want to request another token for the same
+    ///   validation.
     ///
     /// # Returns
     ///
     /// * `sid` - The session ID to be used in following requests for this 3PID.
     ///
     /// * `submit_url` - If present, the user will submit the token to the
-    /// client, that must send it to this URL. If not, the client will not be
-    /// involved in the token submission.
+    ///   client, that must send it to this URL. If not, the client will not be
+    ///   involved in the token submission.
     ///
     /// This method might return an [`ErrorKind::ThreepidInUse`] error if the
     /// phone number is already registered for this account or another, or an
@@ -580,18 +587,18 @@ impl Account {
     /// # Arguments
     ///
     /// * `client_secret` - The same client secret used in
-    /// [`Account::request_3pid_email_token()`] or
-    /// [`Account::request_3pid_msisdn_token()`].
+    ///   [`Account::request_3pid_email_token()`] or
+    ///   [`Account::request_3pid_msisdn_token()`].
     ///
     /// * `sid` - The session ID returned in
-    /// [`Account::request_3pid_email_token()`] or
-    /// [`Account::request_3pid_msisdn_token()`].
+    ///   [`Account::request_3pid_email_token()`] or
+    ///   [`Account::request_3pid_msisdn_token()`].
     ///
     /// * `auth_data` - This request uses the [User-Interactive Authentication
-    /// API][uiaa]. The first request needs to set this to `None` and will
-    /// always fail with an [`UiaaResponse`]. The response will contain
-    /// information for the interactive auth and the same request needs to be
-    /// made but this time with some `auth_data` provided.
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail with an [`UiaaResponse`]. The response will contain
+    ///   information for the interactive auth and the same request needs to be
+    ///   made but this time with some `auth_data` provided.
     ///
     /// [3pid]: https://spec.matrix.org/v1.2/appendices/#3pid-types
     /// [uiaa]: https://spec.matrix.org/v1.2/client-server-api/#user-interactive-authentication-api
@@ -620,17 +627,17 @@ impl Account {
     /// * `medium` - The type of the 3PID.
     ///
     /// * `id_server` - The identity server to unbind from. If not provided, the
-    /// homeserver should unbind the 3PID from the identity server it was bound
-    /// to previously.
+    ///   homeserver should unbind the 3PID from the identity server it was
+    ///   bound to previously.
     ///
     /// # Returns
     ///
     /// * [`ThirdPartyIdRemovalStatus::Success`] if the 3PID was also unbound
-    /// from the identity server.
+    ///   from the identity server.
     ///
     /// * [`ThirdPartyIdRemovalStatus::NoSupport`] if the 3PID was not unbound
-    /// from the identity server. This can also mean that the 3PID was not bound
-    /// to an identity server in the first place.
+    ///   from the identity server. This can also mean that the 3PID was not
+    ///   bound to an identity server in the first place.
     ///
     /// # Examples
     ///
@@ -733,8 +740,7 @@ impl Account {
         &self,
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>> {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request = get_global_account_data::v3::Request::new(own_user.to_owned(), event_type);
 
@@ -787,8 +793,7 @@ impl Account {
     where
         T: GlobalAccountDataEventContent,
     {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request = set_global_account_data::v3::Request::new(own_user.to_owned(), &content)?;
 
@@ -801,8 +806,7 @@ impl Account {
         event_type: GlobalAccountDataEventType,
         content: Raw<AnyGlobalAccountDataEventContent>,
     ) -> Result<set_global_account_data::v3::Response> {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request =
             set_global_account_data::v3::Request::new_raw(own_user.to_owned(), event_type, content);
@@ -817,7 +821,7 @@ impl Account {
     ///
     /// * `room_id` - The room ID of the direct message room.
     /// * `user_ids` - The user IDs to be associated with this direct message
-    /// room.
+    ///   room.
     pub async fn mark_as_dm(&self, room_id: &RoomId, user_ids: &[OwnedUserId]) -> Result<()> {
         use ruma::events::direct::DirectEventContent;
 
@@ -898,7 +902,7 @@ impl Account {
         Ok(ignored_user_list)
     }
 
-    /// Get the current push rules.
+    /// Get the current push rules from storage.
     ///
     /// If no push rules event was found, or it fails to deserialize, a ruleset
     /// with the server-default push rules is returned.
@@ -920,6 +924,47 @@ impl Account {
                     self.client.user_id().expect("The client should be logged in"),
                 )
             }))
+    }
+
+    /// Retrieves the user's recently visited room list
+    pub async fn get_recently_visited_rooms(&self) -> Result<Vec<OwnedRoomId>> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        let data = self
+            .client
+            .store()
+            .get_kv_data(StateStoreDataKey::RecentlyVisitedRooms(user_id))
+            .await?;
+
+        Ok(data
+            .map(|v| {
+                v.into_recently_visited_rooms()
+                    .expect("Session data is not a list of recently visited rooms")
+            })
+            .unwrap_or_default())
+    }
+
+    /// Moves/inserts the given room to the front of the recently visited list
+    pub async fn track_recently_visited_room(&self, room_id: OwnedRoomId) -> Result<(), Error> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+
+        // Get the previously stored recently visited rooms
+        let mut recently_visited_rooms = self.get_recently_visited_rooms().await?;
+
+        // Remove all other occurrences of the new room_id
+        recently_visited_rooms.retain(|r| r != &room_id);
+
+        // And insert it as the most recent
+        recently_visited_rooms.insert(0, room_id);
+
+        // Cap the whole list to the VISITED_ROOMS_LIMIT
+        recently_visited_rooms.truncate(Self::VISITED_ROOMS_LIMIT);
+
+        let data = StateStoreDataValue::RecentlyVisitedRooms(recently_visited_rooms);
+        self.client
+            .store()
+            .set_kv_data(StateStoreDataKey::RecentlyVisitedRooms(user_id), data)
+            .await?;
+        Ok(())
     }
 }
 
