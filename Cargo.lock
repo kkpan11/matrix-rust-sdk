@@ -2982,6 +2982,7 @@ dependencies = [
  "assert_matches2",
  "eyeball-im",
  "futures-core",
+ "futures-executor",
  "futures-util",
  "getrandom 0.2.15",
  "gloo-timers",

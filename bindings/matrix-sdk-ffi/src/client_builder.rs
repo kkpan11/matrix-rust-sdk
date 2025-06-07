@@ -1,6 +1,5 @@
 use std::{fs, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
-use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
 use matrix_sdk::{
     authentication::oauth::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
@@ -27,7 +26,7 @@ use zeroize::Zeroizing;
 use super::client::Client;
 use crate::{
     authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
-    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
+    helpers::unwrap_or_clone_arc, runtime::get_runtime_handle, task_handle::TaskHandle,
 };
 
 /// A list of bytes containing a certificate in DER or PEM form.

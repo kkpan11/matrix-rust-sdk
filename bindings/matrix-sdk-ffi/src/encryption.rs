@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
 use matrix_sdk::{
     encryption,
@@ -11,7 +10,10 @@ use thiserror::Error;
 use tracing::{error, info};
 use zeroize::Zeroize;
 
-use crate::{client::Client, error::ClientError, ruma::AuthData, task_handle::TaskHandle};
+use crate::{
+    client::Client, error::ClientError, ruma::AuthData, runtime::get_runtime_handle,
+    task_handle::TaskHandle,
+};
 
 #[derive(uniffi::Object)]
 pub struct Encryption {
