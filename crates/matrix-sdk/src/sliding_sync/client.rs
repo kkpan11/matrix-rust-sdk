@@ -1,11 +1,8 @@
 use std::collections::BTreeSet;
 
 use matrix_sdk_base::{sync::SyncResponse, RequestedRequiredStates};
-use ruma::{
-    api::client::{discovery::get_supported_versions, sync::sync_events::v5 as http},
-    events::AnyToDeviceEvent,
-    serde::Raw,
-};
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
+use ruma::api::client::{discovery::get_supported_versions, sync::sync_events::v5 as http};
 use tracing::error;
 
 use super::{SlidingSync, SlidingSyncBuilder};
@@ -154,7 +151,7 @@ impl Client {
 #[must_use]
 pub(crate) struct SlidingSyncResponseProcessor {
     client: Client,
-    to_device_events: Vec<Raw<AnyToDeviceEvent>>,
+    to_device_events: Vec<ProcessedToDeviceEvent>,
     response: Option<SyncResponse>,
 }
 
@@ -232,7 +229,7 @@ impl SlidingSyncResponseProcessor {
 async fn update_in_memory_caches(client: &Client, response: &SyncResponse) -> Result<()> {
     for room_id in response.rooms.joined.keys() {
         let Some(room) = client.get_room(room_id) else {
-            error!(room_id = ?room_id, "Cannot post process a room in sliding sync because it is missing");
+            error!(?room_id, "Cannot post process a room in sliding sync because it is missing");
             continue;
         };
 

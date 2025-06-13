@@ -2,7 +2,6 @@
 
 use std::{fmt::Debug, mem::MaybeUninit, ptr::addr_of_mut, sync::Arc, time::Duration};
 
-use async_compat::get_runtime_handle;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
@@ -25,6 +24,7 @@ use matrix_sdk_ui::{
 
 use crate::{
     room::{Membership, Room},
+    runtime::get_runtime_handle,
     TaskHandle,
 };
 

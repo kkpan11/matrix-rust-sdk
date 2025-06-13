@@ -1,7 +1,6 @@
 use std::{collections::HashMap, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
-use async_compat::get_runtime_handle;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     crypto::LocalTrust,
@@ -47,6 +46,7 @@ use crate::{
     room_member::{RoomMember, RoomMemberWithSenderInfo},
     room_preview::RoomPreview,
     ruma::{ImageInfo, LocationContent, Mentions, NotifyType},
+    runtime::get_runtime_handle,
     timeline::{
         configuration::{TimelineConfiguration, TimelineFilter},
         EventTimelineItem, ReceiptType, SendHandle, Timeline,
@@ -777,9 +777,13 @@ impl Room {
     /// It will configure the notify type: ring or notify based on:
     ///  - is this a DM room -> ring
     ///  - is this a group with more than one other member -> notify
-    pub async fn send_call_notification_if_needed(&self) -> Result<(), ClientError> {
-        self.inner.send_call_notification_if_needed().await?;
-        Ok(())
+    ///
+    /// Returns:
+    ///  - `Ok(true)` if the event was successfully sent.
+    ///  - `Ok(false)` if we didn't send it because it was unnecessary.
+    ///  - `Err(_)` if sending the event failed.
+    pub async fn send_call_notification_if_needed(&self) -> Result<bool, ClientError> {
+        Ok(self.inner.send_call_notification_if_needed().await?)
     }
 
     /// Send a call notification event in the current room.
@@ -824,18 +828,31 @@ impl Room {
 
     /// Store the given `ComposerDraft` in the state store using the current
     /// room id, as identifier.
-    pub async fn save_composer_draft(&self, draft: ComposerDraft) -> Result<(), ClientError> {
-        Ok(self.inner.save_composer_draft(draft.try_into()?).await?)
+    pub async fn save_composer_draft(
+        &self,
+        draft: ComposerDraft,
+        thread_root: Option<String>,
+    ) -> Result<(), ClientError> {
+        let thread_root = thread_root.map(EventId::parse).transpose()?;
+        Ok(self.inner.save_composer_draft(draft.try_into()?, thread_root.as_deref()).await?)
     }
 
     /// Retrieve the `ComposerDraft` stored in the state store for this room.
-    pub async fn load_composer_draft(&self) -> Result<Option<ComposerDraft>, ClientError> {
-        Ok(self.inner.load_composer_draft().await?.map(Into::into))
+    pub async fn load_composer_draft(
+        &self,
+        thread_root: Option<String>,
+    ) -> Result<Option<ComposerDraft>, ClientError> {
+        let thread_root = thread_root.map(EventId::parse).transpose()?;
+        Ok(self.inner.load_composer_draft(thread_root.as_deref()).await?.map(Into::into))
     }
 
     /// Remove the `ComposerDraft` stored in the state store for this room.
-    pub async fn clear_composer_draft(&self) -> Result<(), ClientError> {
-        Ok(self.inner.clear_composer_draft().await?)
+    pub async fn clear_composer_draft(
+        &self,
+        thread_root: Option<String>,
+    ) -> Result<(), ClientError> {
+        let thread_root = thread_root.map(EventId::parse).transpose()?;
+        Ok(self.inner.clear_composer_draft(thread_root.as_deref()).await?)
     }
 
     /// Edit an event given its event id.

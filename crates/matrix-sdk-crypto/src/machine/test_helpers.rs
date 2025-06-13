@@ -18,6 +18,7 @@
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
 use as_variant::as_variant;
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_test::{ruma_response_from_json, test_json};
 use ruma::{
     api::client::keys::{
@@ -38,11 +39,11 @@ use tokio::sync::Mutex;
 use crate::{
     machine::tests,
     olm::PrivateCrossSigningIdentity,
-    store::{Changes, CryptoStoreWrapper, MemoryStore},
+    store::{types::Changes, CryptoStoreWrapper, MemoryStore},
     types::{
         events::ToDeviceEvent,
         requests::{AnyOutgoingRequest, ToDeviceRequest},
-        DeviceKeys, ProcessedToDeviceEvent,
+        DeviceKeys,
     },
     utilities::json_convert,
     verification::VerificationMachine,

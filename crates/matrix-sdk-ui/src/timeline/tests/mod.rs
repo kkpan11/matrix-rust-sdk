@@ -123,7 +123,7 @@ impl TestTimelineBuilder {
     fn build(self) -> TestTimeline {
         let mut controller = TimelineController::new(
             self.provider.unwrap_or_default(),
-            TimelineFocus::Live,
+            TimelineFocus::Live { hide_threaded_events: false },
             self.internal_id_prefix,
             self.utd_hook,
             self.is_room_encrypted,
@@ -186,7 +186,7 @@ impl TestTimeline {
     }
 
     async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
-        let timeline_event = TimelineEvent::new(event.cast());
+        let timeline_event = TimelineEvent::from_plaintext(event.cast());
         self.controller
             .handle_remote_events_with_diffs(
                 vec![VectorDiff::PushFront { value: timeline_event }],

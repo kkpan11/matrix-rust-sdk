@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{anyhow, Context as _};
-use async_compat::get_runtime_handle;
 use futures_util::pin_mut;
 use matrix_sdk::{
     authentication::oauth::{
@@ -92,13 +91,15 @@ use crate::{
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
-    room::RoomHistoryVisibility,
+    room::{RoomHistoryVisibility, RoomInfoListener},
     room_directory_search::RoomDirectorySearch,
+    room_info::RoomInfo,
     room_preview::RoomPreview,
     ruma::{
         AccountDataEvent, AccountDataEventType, AuthData, InviteAvatars, MediaPreviewConfig,
         MediaPreviews, MediaSource, RoomAccountDataEvent, RoomAccountDataEventType,
     },
+    runtime::get_runtime_handle,
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
     utd::{UnableToDecryptDelegate, UtdHook},
@@ -821,7 +822,7 @@ impl Client {
         .with_max_delay(UTD_HOOK_GRACE_PERIOD);
 
         if let Err(e) = utd_hook_manager.reload_from_store().await {
-            error!("Unable to reload UTD hook data from data store: {}", e);
+            error!("Unable to reload UTD hook data from data store: {e}");
             // Carry on with the setup anyway; we shouldn't fail setup just
             // because the UTD hook failed to load its data.
         }
@@ -1443,7 +1444,7 @@ impl Client {
                 .map_err(EventCacheError::from)?;
 
             // Clear all the room chunks. It's important to *not* call
-            // `EventCacheStore::clear_all_rooms_chunks` here, because there might be live
+            // `EventCacheStore::clear_all_linked_chunks` here, because there might be live
             // observers of the linked chunks, and that would cause some very bad state
             // mismatch.
             self.inner.event_cache().clear_all_rooms().await?;
@@ -1559,6 +1560,49 @@ impl Client {
     pub async fn get_max_media_upload_size(&self) -> Result<u64, ClientError> {
         let max_upload_size = self.inner.load_or_fetch_max_upload_size().await?;
         Ok(max_upload_size.into())
+    }
+
+    /// Subscribe to [`RoomInfo`] updates given a provided [`RoomId`].
+    ///
+    /// This works even for rooms we haven't received yet, so we can subscribe
+    /// to this and wait until we receive updates from them when sync responses
+    /// are processed.
+    ///
+    /// Note this method should be used sparingly since using callback
+    /// interfaces is expensive, as well as keeping them alive for a long
+    /// time. Usages of this method should be short-lived and dropped as
+    /// soon as possible.
+    pub async fn subscribe_to_room_info(
+        &self,
+        room_id: String,
+        listener: Box<dyn RoomInfoListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        // Emit the initial event, if present
+        if let Some(room) = self.inner.get_room(&room_id) {
+            if let Ok(room_info) = RoomInfo::new(&room).await {
+                listener.call(room_info);
+            }
+        }
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn({
+            let client = self.inner.clone();
+            let mut receiver = client.room_info_notable_update_receiver();
+            async move {
+                while let Ok(room_update) = receiver.recv().await {
+                    if room_update.room_id != room_id {
+                        continue;
+                    }
+
+                    if let Some(room) = client.get_room(&room_id) {
+                        if let Ok(room_info) = RoomInfo::new(&room).await {
+                            listener.call(room_info);
+                        }
+                    }
+                }
+            }
+        }))))
     }
 }
 

@@ -6,8 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.12.0] - 2025-06-10
+
 Breaking changes:
 
+- `Client::send_call_notification_if_needed` now returns `Result<bool>` instead of `Result<()>` so we can check if 
+  the event was sent.
 - `Client::upload_avatar` and `Timeline::send_attachment` now may fail if a file too large for the homeserver media
   config is uploaded.
 - `UploadParameters` replaces field `filename: String` with `source: UploadSource`.
@@ -21,6 +25,9 @@ Breaking changes:
 
 Additions:
 
+- `Client::subscribe_to_room_info` allows clients to subscribe to room info updates in rooms which may not be known yet. 
+  This is useful when displaying a room preview for an unknown room, so when we receive any membership change for it, 
+  we can automatically update the UI.
 - `Client::get_max_media_upload_size` to get the max size of a request sent to the homeserver so we can tweak our media
   uploads by compressing/transcoding the media.
 - Add `ClientBuilder::enable_share_history_on_invite` to enable experimental support for sharing encrypted room history on invite, per [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
@@ -34,6 +41,8 @@ Additions:
   ([#4994](https://github.com/matrix-org/matrix-rust-sdk/pull/4994))
 - Add `Timeline::send_gallery` to send MSC4274-style galleries.
   ([#5163](https://github.com/matrix-org/matrix-rust-sdk/pull/5163))
+- Add `reply_params` to `GalleryUploadParameters` to allow sending galleries as (threaded) replies.
+  ([#5173](https://github.com/matrix-org/matrix-rust-sdk/pull/5173))
 
 Breaking changes:
 

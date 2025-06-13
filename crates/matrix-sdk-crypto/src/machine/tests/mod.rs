@@ -19,8 +19,9 @@ use futures_util::{pin_mut, FutureExt, StreamExt};
 use itertools::Itertools;
 use matrix_sdk_common::{
     deserialized_responses::{
-        AlgorithmInfo, UnableToDecryptInfo, UnableToDecryptReason, UnsignedDecryptionResult,
-        UnsignedEventLocation, VerificationLevel, VerificationState, WithheldCode,
+        AlgorithmInfo, ProcessedToDeviceEvent, UnableToDecryptInfo, UnableToDecryptReason,
+        UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel, VerificationState,
+        WithheldCode,
     },
     executor::spawn,
 };
@@ -63,8 +64,8 @@ use crate::{
     olm::{BackedUpRoomKey, ExportedRoomKey, SenderData, VerifyJson},
     session_manager::CollectStrategy,
     store::{
-        BackupDecryptionKey, Changes, CryptoStore, DeviceChanges, MemoryStore, PendingChanges,
-        RoomKeyInfo,
+        types::{BackupDecryptionKey, Changes, DeviceChanges, PendingChanges, RoomKeyInfo},
+        CryptoStore, MemoryStore,
     },
     types::{
         events::{
@@ -73,7 +74,7 @@ use crate::{
             ToDeviceEvent,
         },
         requests::{AnyOutgoingRequest, ToDeviceRequest},
-        DeviceKeys, ProcessedToDeviceEvent, SignedKey, SigningKeys,
+        DeviceKeys, SignedKey, SigningKeys,
     },
     utilities::json_convert,
     verification::tests::bob_id,

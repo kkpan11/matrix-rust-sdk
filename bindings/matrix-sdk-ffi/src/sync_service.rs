@@ -14,7 +14,6 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use async_compat::get_runtime_handle;
 use futures_util::pin_mut;
 use matrix_sdk::Client;
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
@@ -27,7 +26,8 @@ use matrix_sdk_ui::{
 };
 
 use crate::{
-    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService, TaskHandle,
+    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService,
+    runtime::get_runtime_handle, TaskHandle,
 };
 
 #[derive(uniffi::Enum)]
